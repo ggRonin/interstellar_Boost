@@ -1,0 +1,18 @@
+# Реальные данные — никогда не коммитить (сид-фразы и ключи = доступ к кошелькам)
+Wallet.txt
+Accounts.txt
+Boost.txt
+Proxy.txt
+code.txt
+Ref.txt
+*.tmp
+*.jsonl
+*.log
+
+# Python / IDE
+__pycache__/
+*.pyc
+.venv/
+venv/
+.idea/
+.vscode/

@@ -1,0 +1,5 @@
+# Python 3.10+ (проверено на 3.14). Установка: python -m pip install -r requirements.txt
+# Капча решается в Node.js >= 22.13 (cap_solver.js, без npm-пакетов): https://nodejs.org
+requests==2.34.2
+eth-account==0.14.0
+mnemonic==0.21
