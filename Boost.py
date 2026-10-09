@@ -34,7 +34,7 @@ from eth_account import Account
 
 import cap
 import config
-from login_wallets import PROXY_FAIL_EXCEPTIONS, WALLET_FILE, daily_checkin, do_quests
+from login_wallets import PROXY_FAIL_EXCEPTIONS, WALLET_FILE, daily_checkin, do_quests, write_lines
 from siwe_login import SiweSession
 
 Account.enable_unaudited_hdwallet_features()
@@ -148,11 +148,7 @@ class CodeStore:
             return len(self.codes)
 
     def _flush(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            for c in self.codes:
-                f.write(c + "\n")
-        os.replace(tmp, self.path)
+        write_lines(self.path, self.codes)
 
 
 def gate_code(code):
@@ -200,11 +196,7 @@ class ProxyPool:
             if not self._pool:
                 return None
             proxy = self._pool.pop(0)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                for p in self._pool:
-                    f.write(p + "\n")
-            os.replace(tmp, self.path)
+            write_lines(self.path, self._pool)
             return proxy
 
     def remaining(self):
@@ -503,11 +495,7 @@ class WalletFile:
             for i, w in self.wallets.items():
                 if w["address"].lower() == addr.lower():
                     self.lines[i] = ",".join(edit(i, self._fields(i)))
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                for line in self.lines:
-                    f.write(line + "\n")
-            os.replace(tmp, self.path)
+            write_lines(self.path, self.lines)
 
 
 def run(codes_store):

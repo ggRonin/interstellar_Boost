@@ -37,7 +37,9 @@ python -m venv .venv
 | `Wallet.example.txt` | `Wallet.txt` | кошельки, по одному на строку (обязателен) |
 | `code.example.txt` | `code.txt` | launch-коды для гейта (нужны в `MODE = 1`) |
 | `Ref.example.txt` | `Ref.txt` | реф-коды для привязки (необязателен) |
-| `Proxy.example.txt` | `Proxy.txt` | запасные прокси `user:pass@host:port` (необязателен) |
+| `Proxy.example.txt` | `Proxy.txt` | запасные прокси, по одному на строку (необязателен) |
+
+Форматы прокси (в `Proxy.txt` и в строках кошельков; можно смешивать): `user:pass@host:port`, `host:port:user:pass`, `user:pass:host:port`, `host:port`, с приставкой `http://` или без неё. SOCKS — с приставкой `socks5://`. Прокси, взятый из `Proxy.txt`, удаляется оттуда и записывается в строку кошелька.
 
 Строка `Wallet.txt`: `seed,derivation path,private key,address,proxy[,session][,done]`. Поля определяются по виду, порядок неважен. Достаточно одной сид-фразы: ключ и адрес вычисляются из неё, прокси берётся из `Proxy.txt` и записывается в строку.
 

@@ -3,28 +3,24 @@
 Mass SIWE login + daily check-in + daily crates for every wallet.
 
 Source of wallets — config.SOURCE:
-    1 -> Accounts.txt (+ new wallets from Wallet.txt), format below;
+    1 -> Accounts.txt, format below (Wallet.txt is not read here: it is Boost.py's file);
     2 -> Boost.txt, one JSON per line {"address", "proxy", "seed_phrase", ...};
          the session token and a swapped proxy are written back into the same line.
-
-Wallet.txt format (one wallet per line):
-    user:pass@host:port,seed word seed word ...
-i.e. proxy first, then a comma, then the mnemonic.
 
 - Login only (accounts already exist -> `created` is False). No registration step.
 - Reuses SiweSession from siwe_login.py: browser headers + proxy are enforced
   there (it refuses to run without a proxy and verifies the exit IP first).
-- Dead proxy (ProxyError/timeout/SSL EOF) -> swap for a spare from Proxy.txt
-  (in-memory, thread-safe) and retry, up to MAX_PROXY_ATTEMPTS. Wallet.txt itself
-  is never rewritten.
+- No proxy in the line, or a dead one (ProxyError/timeout/SSL EOF) -> the next spare from
+  Proxy.txt, up to MAX_PROXY_ATTEMPTS. A taken proxy is deleted from Proxy.txt for good and
+  written into the account's line right away.
 - Every launch processes ALL wallets again (login + open daily crates);
   results go to a new wallet_login_results_<YYYYmmdd_HHMMSS>.jsonl per run.
 - Sessions are kept in Accounts.txt, one account per line:
       seed word seed word ...,user:pass@host:port,name=value; name=value
   (seed, proxy, session-cookie token). If the token is still valid the account
   works through it (no SIWE login, no captcha); otherwise a fresh login is done
-  and the new token (and a swapped proxy, if any) is written back. Accounts.txt
-  is created from Wallet.txt on first run; new wallets in Wallet.txt are appended.
+  and the new token (and a swapped proxy, if any) is written back. A line may hold
+  only the seed: the proxy is then taken from Proxy.txt and saved with the session.
 """
 
 import json
@@ -68,34 +64,55 @@ PROXY_FAIL_EXCEPTIONS = (
 )
 
 
+REPLACE_RETRIES = 50       # Windows: file briefly locked (antivirus, OneDrive, open in an editor)
+REPLACE_DELAY = 0.2        # s between tries -> up to ~10 s
+
+
+def write_lines(path, lines):
+    """Rewrites `path` atomically (temp file + os.replace). On Windows os.replace fails with
+    PermissionError while another program holds the file open -> retry for a while."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+    for i in range(REPLACE_RETRIES):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == REPLACE_RETRIES - 1:
+                raise PermissionError(f"{path} is locked by another program (close it in the editor, "
+                                      f"exclude the folder from antivirus / OneDrive)")
+            time.sleep(REPLACE_DELAY)
+
+
 def _parse_line(line):
-    """Accounts.txt: seed,proxy,token  |  Wallet.txt: proxy,seed. Returns (seed, proxy, token)."""
+    """Accounts.txt: seed[,proxy[,token]] (a line with only the seed is fine: the proxy is taken
+    from Proxy.txt and saved with the session). Returns (seed, proxy, token) or None."""
     parts = [p.strip() for p in line.split(",")]
-    if len(parts) < 2:
+    if " " not in parts[0]:
         return None
-    if " " in parts[0]:
-        return parts[0], parts[1], ",".join(parts[2:]).strip()
-    return parts[1], parts[0], ""
+    return parts[0], parts[1] if len(parts) > 1 else "", ",".join(parts[2:]).strip()
 
 
 class AccountStore:
-    """address -> [seed, proxy, token]; every update rewrites Accounts.txt atomically."""
+    """address -> [seed, proxy, token]; every update rewrites Accounts.txt atomically.
+    Only Accounts.txt is read: Wallet.txt belongs to Boost.py (other format, other derivation path)."""
 
-    def __init__(self, accounts_path, wallet_path):
+    def __init__(self, accounts_path):
         self.path = accounts_path
         self.lock = threading.Lock()
         self.rows = {}
-        for path in (accounts_path, wallet_path):
-            if not os.path.exists(path):
-                continue
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    parsed = _parse_line(line.strip())
-                    if not parsed:
-                        continue
-                    seed, proxy, token = parsed
-                    addr = Account.from_mnemonic(seed, account_path=config.DERIVATION_PATH).address
-                    self.rows.setdefault(addr, [seed, proxy, token])
+        if not os.path.exists(accounts_path):
+            raise SystemExit(f"[!] {accounts_path} not found (format: seed[,proxy[,session]])")
+        with open(accounts_path, "r", encoding="utf-8") as f:
+            for line in f:
+                parsed = _parse_line(line.strip()) if line.strip() else None
+                if not parsed:
+                    continue
+                seed, proxy, token = parsed
+                addr = Account.from_mnemonic(seed, account_path=config.DERIVATION_PATH).address
+                self.rows.setdefault(addr, [seed, proxy, token])
         self._flush()
 
     def wallets(self):
@@ -108,11 +125,7 @@ class AccountStore:
             self._flush()
 
     def _flush(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            for seed, proxy, token in self.rows.values():
-                f.write(f"{seed},{proxy},{token}\n")
-        os.replace(tmp, self.path)
+        write_lines(self.path, [f"{seed},{proxy},{token}" for seed, proxy, token in self.rows.values()])
 
     def close(self):
         pass
@@ -173,11 +186,7 @@ class BoostStore:
                 self._flush()
 
     def _flush(self):
-        tmp = self.path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            for e in self.entries:
-                f.write((json.dumps(e) if isinstance(e, dict) else e) + "\n")
-        os.replace(tmp, self.path)
+        write_lines(self.path, [json.dumps(e) if isinstance(e, dict) else e for e in self.entries])
         self._dirty = False
         self._last_flush = time.monotonic()
 
@@ -188,7 +197,11 @@ class BoostStore:
 
 
 class ProxyPool:
+    """Spare proxies from Proxy.txt. A taken proxy is deleted from the file for good,
+    so the same one is never handed out twice (also across runs and to Boost.py)."""
+
     def __init__(self, proxy_file):
+        self.path = proxy_file
         self.lock = threading.Lock()
         try:
             with open(proxy_file, "r", encoding="utf-8") as f:
@@ -198,7 +211,11 @@ class ProxyPool:
 
     def take(self):
         with self.lock:
-            return self._pool.pop(0) if self._pool else None
+            if not self._pool:
+                return None
+            proxy = self._pool.pop(0)
+            write_lines(self.path, self._pool)
+            return proxy
 
     def remaining(self):
         with self.lock:
@@ -379,8 +396,9 @@ def process(idx, proxy, seed, address, token, pool, results, store):
         if not proxy or proxy.strip().lower() == "noproxy":
             proxy = pool.take()
             if not proxy:
-                last_error = "no spare proxies left"
+                last_error = (f"{last_error} — " if last_error else "") + "no spare proxies left"
                 break
+            store.update(address, proxy, token)   # saved right away: it is gone from Proxy.txt
         try:
             siwe = SiweSession(seed_phrase=seed, expected_address=address,
                                proxy=proxy, verbose=False)
@@ -408,10 +426,7 @@ def process(idx, proxy, seed, address, token, pool, results, store):
             return rec
         except PROXY_FAIL_EXCEPTIONS as e:
             last_error = f"proxy dead ({attempt}/{config.MAX_PROXY_ATTEMPTS}): {e}"
-            proxy = pool.take()
-            if not proxy:
-                last_error += " — no spare proxies left"
-                break
+            proxy = None   # next one from Proxy.txt at the top of the loop
             continue
         except Exception as e:
             last_error = str(e)
@@ -461,9 +476,9 @@ def _print_result(res, addr, done, total):
 
 
 def open_store():
-    """config.SOURCE: 1 — Accounts.txt (+ Wallet.txt), 2 — Boost.txt. Returns (store, file name)."""
+    """config.SOURCE: 1 — Accounts.txt, 2 — Boost.txt. Returns (store, file name)."""
     if config.SOURCE == 1:
-        return AccountStore(ACCOUNTS_FILE, WALLET_FILE), ACCOUNTS_FILE
+        return AccountStore(ACCOUNTS_FILE), ACCOUNTS_FILE
     if config.SOURCE == 2:
         if not os.path.exists(config.BOOST_FILE):
             raise SystemExit(f"[!] SOURCE = 2, but {config.BOOST_FILE} not found")

@@ -3,3 +3,4 @@
 requests==2.34.2
 eth-account==0.14.0
 mnemonic==0.21
+PySocks==1.7.1   # только для прокси socks5:// (для http-прокси не нужен)

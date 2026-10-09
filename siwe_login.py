@@ -23,6 +23,27 @@ import config
 Account.enable_unaudited_hdwallet_features()
 
 
+def proxy_url(proxy: str) -> str:
+    """Proxy from the files -> URL for requests. Accepted:
+        user:pass@host:port              -> http://user:pass@host:port
+        host:port:user:pass              -> http://user:pass@host:port
+        user:pass:host:port              -> http://user:pass@host:port
+        host:port                        -> http://host:port
+        http:// / https:// / socks5:// / socks5h:// + any of the above (socks needs PySocks)"""
+    p = proxy.strip()
+    scheme, sep, rest = p.partition("://")
+    if not sep:
+        scheme, rest = "http", p
+    if "@" not in rest:
+        parts = rest.split(":")
+        if len(parts) == 4:
+            if parts[1].isdigit():                    # host:port:user:pass
+                rest = f"{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
+            elif parts[3].isdigit():                  # user:pass:host:port
+                rest = f"{parts[0]}:{parts[1]}@{parts[2]}:{parts[3]}"
+    return f"{scheme.lower()}://{rest}"
+
+
 class SiweSession:
     """Handles wallet derivation, proxy setup and the SIWE auth handshake."""
 
@@ -54,9 +75,10 @@ class SiweSession:
             raise RuntimeError(
                 "No proxy set for this wallet — refusing to run without a proxy."
             )
+        url = proxy_url(self.proxy)
         proxies = {
-            "http": f"http://{self.proxy}",
-            "https": f"http://{self.proxy}",
+            "http": url,
+            "https": url,
         }
         self.session.proxies.update(proxies)
         self.session.headers.update(config.BROWSER_HEADERS)
