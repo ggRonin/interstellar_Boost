@@ -6,6 +6,8 @@ Sign-In With Ethereum (nonce -> personal_sign -> verify), exactly mirroring
 the flow captured from the live site's network tab.
 """
 
+import hashlib
+import random
 import sys
 from datetime import datetime, timedelta, timezone
 
@@ -13,7 +15,7 @@ if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import requests
+from curl_cffi import CurlOpt, requests
 from eth_account import Account
 from eth_account.messages import encode_defunct
 
@@ -29,7 +31,7 @@ def proxy_url(proxy: str) -> str:
         host:port:user:pass              -> http://user:pass@host:port
         user:pass:host:port              -> http://user:pass@host:port
         host:port                        -> http://host:port
-        http:// / https:// / socks5:// / socks5h:// + any of the above (socks needs PySocks)"""
+        http:// / https:// / socks5:// / socks5h:// + any of the above (socks is built into curl)"""
     p = proxy.strip()
     scheme, sep, rest = p.partition("://")
     if not sep:
@@ -44,6 +46,56 @@ def proxy_url(proxy: str) -> str:
     return f"{scheme.lower()}://{rest}"
 
 
+GREASE_CHARS = " (:-./);=?_"
+GREASE_VERSIONS = ["8", "99", "24"]
+GREASE_ORDERS = [(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0)]
+
+
+def chrome_now() -> int:
+    """Today's stable Chrome major, counted from a known release (no network call)."""
+    major, date = config.CHROME_RELEASE
+    since = datetime.now(timezone.utc) - datetime.fromisoformat(date).replace(tzinfo=timezone.utc)
+    return major + max(0, since.days) // 28
+
+
+def sec_ch_ua(brand: str, v: int) -> str:
+    """Sec-CH-UA exactly as Chrome builds it: the GREASE brand and the order depend on the major version."""
+    grease = f"Not{GREASE_CHARS[v % 11]}A{GREASE_CHARS[(v + 1) % 11]}Brand"
+    slots = [None] * 3
+    for pos, item in zip(GREASE_ORDERS[v % 6], [(grease, GREASE_VERSIONS[v % 3]), ("Chromium", v), (brand, v)]):
+        slots[pos] = item
+    return ", ".join(f'"{b}";v="{ver}"' for b, ver in slots)
+
+
+def browser(address: str) -> dict:
+    """The wallet's own browser (Chrome or Edge on Windows), the same on every run: drawn from the address.
+    Most are on the latest version, some a version or two behind; it updates with time like a real one."""
+    r = random.Random(int.from_bytes(hashlib.sha256(f"browser:{address.lower()}".encode()).digest()[:8], "big"))
+    edge = r.random() < config.EDGE_SHARE
+    v = chrome_now() - r.choice(config.CHROME_LAG)
+    lang = r.choice(config.LANGS)
+    ua = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36"
+    if edge:
+        ua += f" Edg/{v}.0.0.0"
+    return {"User-Agent": ua, "Sec-CH-UA": sec_ch_ua("Microsoft Edge" if edge else "Google Chrome", v),
+            "Accept-Language": lang}
+
+
+class BrowserSession(requests.Session):
+    """curl_cffi session that sends requests like the site's fetch() in Chrome: TLS/HTTP2 of
+    config.IMPERSONATE, Chrome's header order, Content-Type and Origin only on requests with a body."""
+
+    def __init__(self):
+        super().__init__(impersonate=config.IMPERSONATE, default_headers=False,
+                         curl_options={CurlOpt.HTTPHEADER_ORDER: ",".join(config.HEADER_ORDER)})
+
+    def request(self, method, url, headers=None, **kw):
+        if method.upper() not in ("GET", "HEAD"):
+            headers = {**config.BODY_HEADERS, **(headers or {})}
+        kw.setdefault("accept_encoding", "gzip, deflate, br, zstd")
+        return super().request(method, url, headers=headers, **kw)
+
+
 class SiweSession:
     """Handles wallet derivation, proxy setup and the SIWE auth handshake."""
 
@@ -52,7 +104,7 @@ class SiweSession:
         self.expected_address = expected_address
         self.proxy = proxy
         self.verbose = verbose
-        self.session = requests.Session()
+        self.session = BrowserSession()
         self.account = None
         self.address = None
 
@@ -82,6 +134,7 @@ class SiweSession:
         }
         self.session.proxies.update(proxies)
         self.session.headers.update(config.BROWSER_HEADERS)
+        self.session.headers.update(browser(self.address))
 
     def _verify_proxy(self):
         """Confirm outbound traffic is actually routed through the proxy before touching the target.
@@ -184,7 +237,7 @@ class SiweSession:
 
     def cookie_string(self) -> str:
         """Куки сессии как 'name=value; name=value' (хранится в Accounts.txt как токен аккаунта)."""
-        return "; ".join(f"{c.name}={c.value}" for c in self.session.cookies
+        return "; ".join(f"{c.name}={c.value}" for c in self.session.cookies.jar
                          if config.SIWE_DOMAIN in (c.domain or config.SIWE_DOMAIN))
 
     def resume(self, token: str):

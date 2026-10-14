@@ -1,6 +1,5 @@
 # Python 3.10+ (проверено на 3.14). Установка: python -m pip install -r requirements.txt
 # Капча решается в Node.js >= 22.13 (cap_solver.js, без npm-пакетов): https://nodejs.org
-requests==2.34.2
+curl_cffi==0.16.3   # TLS/HTTP2 как у Chrome (config.IMPERSONATE)
 eth-account==0.14.0
 mnemonic==0.21
-PySocks==1.7.1   # только для прокси socks5:// (для http-прокси не нужен)

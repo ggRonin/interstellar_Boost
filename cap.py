@@ -5,7 +5,7 @@
 2. задачи решает cap_solver.js в Node
 3. POST {CAP_ENDPOINT}redeem     -> токен для заголовка X-Captcha-Token
 
-Запросы идут той же requests-сессией аккаунта (тот же прокси и User-Agent), что и вход.
+Запросы идут той же сессией аккаунта (тот же прокси и User-Agent), что и вход.
 
 Скрипт instrumentation присылает сервер капчи, то есть это чужой код. Поэтому Node запускается
 с --permission (читать можно только cap_env.js; файлы, дочерние процессы и воркеры закрыты)
@@ -46,7 +46,7 @@ def _cap_headers(session):
         "Sec-Fetch-Site": "cross-site",
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Dest": "empty",
-        # requests-сессия по умолчанию шлёт application/json; у пустого POST виджета его нет
+        # сессия добавляет application/json к POST; у пустого POST виджета его нет
         "Content-Type": None,
     }
 
@@ -57,7 +57,7 @@ def _hashwx_wasm(session):
     with _wasm_lock:
         if _wasm_b64 is None:
             r = session.get(config.CAP_HASHWX_URL, timeout=config.API_TIMEOUT,
-                            headers={"Accept": "*/*", "Sec-Fetch-Dest": "empty", "Content-Type": None})
+                            headers={"Accept": "*/*", "Sec-Fetch-Dest": "empty"})
             r.raise_for_status()
             if r.content[:4] != b"\0asm":
                 raise CaptchaError("hashwx.wasm: ответ не похож на WebAssembly")
@@ -65,13 +65,18 @@ def _hashwx_wasm(session):
         return _wasm_b64
 
 
-def _browser_env():
-    """Отпечаток для instrumentation — тот же браузер, что в BROWSER_HEADERS."""
-    h = config.BROWSER_HEADERS
-    brands = re.findall(r'"([^"]+)";v="(\d+)"', h.get("Sec-CH-UA", ""))
-    env = {"userAgent": h["User-Agent"]}
+def _browser_env(session):
+    """Отпечаток для instrumentation — тот же браузер аккаунта, что в заголовках сессии."""
+    h = session.headers
+    env = {}
+    if h.get("User-Agent"):
+        env["userAgent"] = h["User-Agent"]
+    brands = re.findall(r'"([^"]+)";v="(\d+)"', h.get("Sec-CH-UA") or "")
     if brands:
         env["brands"] = [[b, v] for b, v in brands]
+    langs = [part.split(";")[0].strip() for part in (h.get("Accept-Language") or "").split(",") if part.strip()]
+    if langs:
+        env["language"], env["languages"] = langs[0], langs
     return env
 
 
@@ -82,9 +87,9 @@ def _sandbox_env():
     return env
 
 
-def _run_solver(challenges, wasm_b64):
+def _run_solver(challenges, wasm_b64, env):
     node = shutil.which(config.CAP_NODE) or config.CAP_NODE
-    payload = json.dumps({"challenges": challenges, "hashwx": wasm_b64, "env": _browser_env()})
+    payload = json.dumps({"challenges": challenges, "hashwx": wasm_b64, "env": env})
     try:
         with _solver_slots:
             p = subprocess.run(
@@ -118,7 +123,7 @@ def _solve_once(session):
     if ch.get("error") or not ch.get("token") or not isinstance(ch.get("challenges"), list):
         raise CaptchaError(f"challenge: {ch.get('error') or ch}")
 
-    solutions = _run_solver(ch["challenges"], _hashwx_wasm(session))
+    solutions = _run_solver(ch["challenges"], _hashwx_wasm(session), _browser_env(session))
     bad = [s for s in solutions if s.get("blocked") or s.get("timeout")]
     if bad:
         # виджет в этом случае тоже не получает токен; повторяем с новой задачей
@@ -138,7 +143,7 @@ def _solve_once(session):
 
 
 def solve(session):
-    """Получить токен капчи для X-Captcha-Token. Сетевые ошибки requests пробрасываются как есть
+    """Получить токен капчи для X-Captcha-Token. Сетевые ошибки curl_cffi пробрасываются как есть
     (их ловит логика смены прокси), ошибки самой капчи — CaptchaError после CAP_ATTEMPTS попыток."""
     last = None
     for _ in range(max(1, config.CAP_ATTEMPTS)):

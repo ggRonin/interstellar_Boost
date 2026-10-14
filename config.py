@@ -28,23 +28,41 @@ CAP_NODE = "node"            # нужен Node.js >= 22.13 (запуск с --pe
 CAP_SOLVE_TIMEOUT = 90       # с, на одно решение
 CAP_ATTEMPTS = 2             # сколько раз пробовать получить токен
 
+# TLS/HTTP2-отпечаток настоящего Chrome (curl_cffi): JA4 t13d1516h2 вместо питоновского t13d1812h1.
+# Самый новый профиль Chrome в curl_cffi; у Chrome TLS от версии к версии не меняется, поэтому
+# User-Agent может быть новее профиля.
+IMPERSONATE = "chrome150"
+
+# Версия Chrome в User-Agent считается от даты: известный релиз + новая major каждые 4 недели.
+CHROME_RELEASE = (144, "2026-01-13")
+CHROME_LAG = [0, 0, 0, 1, 1, 2]       # на сколько версий аккаунт отстаёт от свежей (случайно, но постоянно)
+EDGE_SHARE = 0.15                     # доля аккаунтов на Microsoft Edge, остальные — Google Chrome
+LANGS = ["en-US,en;q=0.9", "en-US,en;q=0.9", "en-US,en;q=0.9", "en-GB,en-US;q=0.9,en;q=0.8",
+         "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7", "uk-UA,uk;q=0.9,ru;q=0.8,en-US;q=0.7,en;q=0.6",
+         "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7", "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
+         "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7"]
+
+# fetch() фронтенда, общее для всех аккаунтов. User-Agent, Sec-CH-UA и Accept-Language у каждого
+# аккаунта свои (siwe_login.browser), Accept-Encoding ставит curl_cffi, Content-Type и Origin
+# добавляются только к запросам с телом (BODY_HEADERS).
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Content-Type": "application/json",
-    "Origin": BASE_URL,
-    "Referer": f"{BASE_URL}/",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "Sec-CH-UA": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
-    "Sec-CH-UA-Mobile": "?0",
     "Sec-CH-UA-Platform": '"Windows"',
+    "Sec-CH-UA-Mobile": "?0",
+    "Accept": "application/json",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+    "Referer": f"{BASE_URL}/",
     "Priority": "u=1, i",
 }
+BODY_HEADERS = {"Content-Type": "application/json", "Origin": BASE_URL}
+
+# Порядок заголовков, как их шлёт Chrome (HTTP/2, fetch()).
+HEADER_ORDER = [
+    "content-length", "sec-ch-ua-platform", "x-csrftoken", "x-captcha-token", "user-agent", "sec-ch-ua",
+    "content-type", "sec-ch-ua-mobile", "accept", "origin", "sec-fetch-site", "sec-fetch-mode",
+    "sec-fetch-dest", "referer", "accept-encoding", "accept-language", "cookie", "priority",
+]
 
 # Откуда брать кошельки:
 #   1 — Accounts.txt (seed,прокси,сессия; новые кошельки дописываются из Wallet.txt)
@@ -62,6 +80,24 @@ OPEN_BOX = 0   # сколько ежедневных сундуков откры
                # 0 — не открывать. Больше дневного лимита сайта (сейчас 3) и больше, чем хватает QE, не откроется
 CHECKIN = 1    # ежедневный чек-ин (/checkin/, нужна капча) — только если сегодня ещё можно
 QUESTS = 1     # разовые задания-ссылки (X/Discord/Telegram/сайт) + «открыть первый сундук»
+
+# Игра Chip Entropico (/game/, game.py): планировщик — у каждого аккаунта своё время следующего захода
+GAME_SOURCE = 1        # 1 — Accounts.txt, 2 — Boost.txt, 3 — Wallet.txt (только кошельки с done: остальные не пущены в игру)
+GAME_THREADS = 10      # сколько аккаунтов обрабатывать одновременно (остальные ждут своего времени)
+GAME_UPGRADE = 1       # 1 — покупать улучшения, пока хватает QE
+GAME_ENTROPY_AT_CHIP = 20   # до этого уровня качается только чип, потом entropy-модуль до максимума, потом чип дальше
+GAME_QE_RESERVE = 0    # не тратить QE ниже этого остатка на балансе
+GAME_TRIALS = 1        # испытания: Bus Guardian (чип 5), Private Key (чип 10), Firewall (чип 18), Attack (чип 25)
+GAME_ATTACK = 0        # Attack: 3000 QE + ставка E; шанс 14% + 76% * (1 - e^(-E/200)); проигрыш — кулдаун 10 мин.
+                       # Победа ЗАВЕРШАЕТ уровень 1: чип «на пенсии» (LEVEL_1_CLOSED), в уровень 2 переносится
+                       # половина кэша, модуль и E; уровень 2 открывается только оплатой трона (30000 E + DACC).
+                       # Бот атакует только при чипе 30 и модуле 10
+GAME_ATTACK_ENTROPY = 600   # ставка E на атаку (600 -> ~86%); атака ждёт, пока E накопится
+GAME_MARGIN_SEC = 120  # запас к расчётному времени следующего захода (когда хватит на апгрейд, кулдауны)
+GAME_CLAIM_BEFORE_FULL_MIN = 20   # кэш клеймится за столько минут до заполнения, даже если апгрейда нет
+                                  # (чип 30 + модуль 10: аккаунт заходит только на этот claim)
+GAME_RETRY_MINUTES = 30     # через сколько повторить аккаунт после ошибки (прокси, вход, ...)
+GAME_SCHEDULE_FILE = "game_schedule.json"   # когда какой аккаунт заходить (рестарт продолжает с него)
 
 BOOST_FILE = "Boost.txt"
 PROXY_FILE = "Proxy.txt"

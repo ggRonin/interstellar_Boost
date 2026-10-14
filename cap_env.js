@@ -22,8 +22,8 @@ const FONT_WIDTHS = {
 const DEFAULT_FONT_WIDTH = 1156.97;
 
 const DEFAULT_ENV = {
-  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-  brands: [['Google Chrome', '131'], ['Chromium', '131'], ['Not_A Brand', '24']],
+  userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+  brands: [['Chromium', '146'], ['Not-A.Brand', '24'], ['Google Chrome', '146']],
   platform: 'Win32',
   uaPlatform: 'Windows',
   language: 'en-US',

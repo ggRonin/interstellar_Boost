@@ -2,13 +2,13 @@
 """
 Registration by referral + launch codes (/codes page).
 
-Every wallet from Wallet.txt (seed,derivation path,private key,address,proxy[,session][,done]):
-  not done yet: bind a referral code from Ref.txt — each code in turn gets a random
+Wallets from Wallet.txt (seed,derivation path,private key,address,proxy[,session][,done]):
+  MODE 1 - only wallets without done: bind a referral code from Ref.txt — each code in turn gets a random
     REGS_MIN..REGS_MAX wallets (POST /referral/bind/, as the site does after a
     ?ref= link) -> present a code from code.txt at the gate (POST /launch/gate/, captcha) ->
     daily check-in -> all quests (as login_wallets.py: Follow on X, Discord, ..., first crate) ->
     its own 3 codes (/launch/codes/, issued right away) go to code.txt -> ",done" is appended;
-  done: daily check-in only.
+  MODE 2 - only wallets with done: daily check-in.
 Session: the saved session (cookies, as in Accounts.txt) is reused - no SIWE login, no captcha;
 if it expired, a fresh login is done (private key) and the new session is written into the line.
 Dead proxy -> replaced by the next one from Proxy.txt (deleted from that file, never reused);
@@ -39,7 +39,7 @@ from siwe_login import SiweSession
 
 Account.enable_unaudited_hdwallet_features()
 
-MODE = 1   # 1 — регистрация новых кошельков + чек-ин у done; 2 — только чек-ин у кошельков с done
+MODE = 2   # 1 — только регистрация кошельков без done (done не трогаем); 2 — только чек-ин у кошельков с done
 THREADS = 10   # сколько кошельков обрабатывать одновременно
 REGS_MIN = 50   # сколько новых кошельков привязать к одному реф-коду из Ref.txt: случайное число
 REGS_MAX = 130   # от REGS_MIN до REGS_MAX для каждого кода (меньше, если кошельков без done не хватает)
@@ -514,8 +514,9 @@ def run(codes_store):
             plan, counts, left = plan_refs(todo, refs)
         else:   # no Ref.txt -> register without a referral
             plan, counts, left = [(w, None) for w in todo], {}, []
-        print(f"[*] MODE 1 - {WALLET_FILE}: {len(todo)} to register, {len(done)} done (check-in only) | "
+        print(f"[*] MODE 1 - {WALLET_FILE}: {len(todo)} to register, {len(done)} done skipped | "
               f"{THREADS} threads")
+        done = []   # registration only: done wallets are not touched
         print(f"[*] {len(refs)} ref code(s) in {REF_FILE}, {REGS_MIN}-{REGS_MAX} per code -> "
               + (", ".join(f"{c}: {n}" for c, n in counts.items()) or "no referral"))
         if left:

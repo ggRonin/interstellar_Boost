@@ -30,7 +30,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
+from curl_cffi import requests
 from eth_account import Account
 
 if sys.platform == "win32" and hasattr(sys.stdout, "reconfigure"):
