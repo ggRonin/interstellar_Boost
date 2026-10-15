@@ -49,7 +49,7 @@ from eth_account import Account
 import cap
 import config
 from Boost import CAPTCHA_RETRIES, ProxyPool, WalletFile, with_session
-from login_wallets import ACCOUNTS_FILE, WALLET_FILE, AccountStore, BoostStore, write_lines
+from login_wallets import ACCOUNTS_FILE, WALLET_FILE, AccountStore, BoostStore, internet_up, write_lines
 
 Account.enable_unaudited_hdwallet_features()
 
@@ -738,15 +738,25 @@ def main():
     stats = {"ticks": 0, "fail": 0, "claimed": Decimal(0), "spent": Decimal(0)}
     running = {}   # future -> address
     idle_note = 0
+    net_trouble = False   # set when a worker reports the machine is offline (net_down)
     ex = ThreadPoolExecutor(max_workers=config.GAME_THREADS)
     try:
         while True:
             now = time.time()
+            # only when a problem was signalled: confirm the connection before touching anything
+            if net_trouble:
+                if internet_up():
+                    print(f"[{time.strftime('%H:%M:%S')}] [+] интернет вернулся — продолжаем")
+                    net_trouble = False
+                elif not running:
+                    time.sleep(config.GAME_NET_WAIT_SEC)   # offline: re-check every GAME_NET_WAIT_SEC
+                    continue
             free = config.GAME_THREADS - len(running)
             busy = set(running.values())
             due = sorted((sched.due_at(a), a) for a in by_addr if a not in busy and sched.due_at(a) <= now)
-            for _, addr in due[:free]:
-                running[ex.submit(with_session, game_job, by_addr[addr], pool, wallet_file)] = addr
+            if not net_trouble:   # offline: let the in-flight ones finish, start nothing new
+                for _, addr in due[:free]:
+                    running[ex.submit(with_session, game_job, by_addr[addr], pool, wallet_file)] = addr
 
             if not running:
                 nxt = min((sched.due_at(a) for a in by_addr), default=now + 60)
@@ -767,6 +777,13 @@ def main():
                     stats["spent"] += res["spent"]
                     text = f"{res['via']} | {res['text']}"
                     sched.set(addr, time.time() + sec, why=why, info=res["info"])
+                elif res.get("net_down"):   # the machine is offline — not a real per-account error
+                    if not net_trouble:
+                        print(f"[{time.strftime('%H:%M:%S')}] [!] интернета нет — пауза, прокси не трогаем")
+                    net_trouble = True
+                    sec, why = 5, "net down"
+                    text = res.get("error")
+                    sched.set(addr, time.time() + sec, why=why)
                 else:
                     stats["fail"] += 1
                     sec, why = config.GAME_RETRY_MINUTES * 60, "retry after error"

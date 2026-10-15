@@ -34,7 +34,8 @@ from eth_account import Account
 
 import cap
 import config
-from login_wallets import PROXY_FAIL_EXCEPTIONS, WALLET_FILE, daily_checkin, do_quests, write_lines
+from login_wallets import (PROXY_FAIL_EXCEPTIONS, WALLET_FILE, daily_checkin, do_quests, internet_up,
+                           write_lines)
 from siwe_login import SiweSession
 
 Account.enable_unaudited_hdwallet_features()
@@ -251,6 +252,10 @@ def with_session(job, wallet, pool, wallet_file):
                 wallet_file.set_field(wallet["address"], "token", siwe.cookie_string())
             return {"ok": True, "via": via, "created": created, **job(siwe)}
         except PROXY_FAIL_EXCEPTIONS as e:
+            # a request failed: check the internet first. If the machine is offline, every proxy fails
+            # the same way — it is not this proxy's fault, so don't burn a spare, just report it
+            if not internet_up():
+                return {"ok": False, "net_down": True, "error": f"net down: {type(e).__name__}"}
             last_error = f"proxy dead ({attempt}/{config.MAX_PROXY_ATTEMPTS}): {e}"
             proxy = None
         except Exception as e:

@@ -64,6 +64,21 @@ PROXY_FAIL_EXCEPTIONS = (
 )
 
 
+def internet_up():
+    """Direct (no-proxy) connectivity check from this machine: True if any GAME_NET_CHECK_HOST answers.
+    Used to tell a dead proxy (swap it) from a dead internet connection (all proxies fail — just wait)."""
+    if not getattr(config, "GAME_NET_CHECK", 0):
+        return True
+    for url in config.GAME_NET_CHECK_HOSTS:
+        try:
+            if requests.get(url, impersonate=config.IMPERSONATE, timeout=config.GAME_NET_TIMEOUT,
+                            allow_redirects=False).status_code < 500:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 REPLACE_RETRIES = 50       # Windows: file briefly locked (antivirus, OneDrive, open in an editor)
 REPLACE_DELAY = 0.2        # s between tries -> up to ~10 s
 
