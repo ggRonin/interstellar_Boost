@@ -34,6 +34,7 @@ Not automated: forks, extractions, blocks, network assault, thrones (on-chain DA
 import json
 import math
 import os
+import random
 import secrets
 import sys
 import threading
@@ -173,8 +174,15 @@ class Tick:
         self.claimed = Decimal(0)
         self.spent = Decimal(0)
         self.bought = {}
+        # claim a random 10-30 min before the cache is full (same figure for this whole visit)
+        self.claim_margin_min = random.uniform(*config.GAME_CLAIM_MARGIN)
+        self._extracted = False   # one discount extraction per visit (cooldown 120 s)
 
     # --- state helpers -------------------------------------------------------------------
+
+    @property
+    def level(self):
+        return self.st.get("level") or 1
 
     def refresh(self):
         self.st = self.game.state()
@@ -325,25 +333,31 @@ class Tick:
         self.waits.append((MIN_WAIT, "firewall"))
         return False
 
+    def _attacking(self):
+        """This L1 account should win the one-time Attack: it is enabled, not won yet, and the trial exists.
+        The chip level does not carry into Level 2, so we attack as soon as it unlocks (chip 25) instead of
+        maxing the chip first."""
+        at = self.st.get("attack") or {}
+        return (config.GAME_ATTACK and self.level < 2
+                and not (self.st.get("victory") or {}).get("completed_at")
+                and at.get("status") in ("locked", "ready", "cooldown"))
+
     def attack(self):
         at = self.st.get("attack") or {}
         if not config.GAME_ATTACK or at.get("status") not in ("ready", "cooldown"):
             return False
-        # a won attack ends Level 1 (the chip is retired, LEVEL_1_CLOSED): only once nothing is left to buy
-        chip, ent = self.st.get("chip") or {}, self.st.get("entropy") or {}
-        if (chip.get("level") or 0) < (chip.get("max_level") or 0) or \
-                (ent.get("module_level") or 0) < (ent.get("max_level") or 0):
+        # the entropy module carries into Level 2 (the chip does not): max it before winning, then attack
+        ent = self.st.get("entropy") or {}
+        if (ent.get("module_level") or 0) < (ent.get("max_level") or 0):
             return False
         if _left(at.get("cooldown_until")) > 0:
-            self.waits.append((_left(at["cooldown_until"]), "attack"))
+            self.waits.append((_left(at["cooldown_until"]), "attack"))   # lost: retry after the cooldown
             return False
-        ent = self.st.get("entropy") or {}
         e_now = _dec(ent.get("amount_exact_e"), Decimal(0))
-        stake = config.GAME_ATTACK_ENTROPY
-        if e_now < stake:
-            rate = _dec(ent.get("rate_e_per_sec"), Decimal(0))
-            if rate > 0:
-                self.waits.append((float((stake - e_now) / rate), f"{stake}E for attack"))
+        # stake for the best odds: p = 14% + 76%*(1 - e^(-E/200)) caps at 90% near 2000 E — more is wasted,
+        # since staked E is consumed on a win too (and would otherwise fuel Level 2 blocks)
+        stake = min(_dec(config.GAME_ATTACK_ENTROPY, Decimal(2000)), e_now)
+        if stake < 1:
             return False
         cost = _dec(at.get("cost_qe"), Decimal(0))
         if self.available < cost:
@@ -353,12 +367,26 @@ class Tick:
         self.claim()   # a lost attack takes a share of the cache
         if self.available < cost:
             return False
-        body = {"entropy": stake}
-        if at.get("randomness") == "verifiable":
-            body.update(action_id=self.game.draw("central_attack"), client_seed=secrets.token_hex(32))
-        ok, d = self.game.action("/game/attack/", **body)
+        # the game caps the stake at the point it reaches ~90% (≈1466 E); a bigger one is INVALID_ENTROPY,
+        # so step down until it is accepted
+        ok, d = False, None
+        for _ in range(5):
+            try:
+                body = {"entropy": int(stake)}
+                if at.get("randomness") == "verifiable":
+                    body.update(action_id=self.game.draw("central_attack"), client_seed=secrets.token_hex(32))
+            except GameError as e:   # the verifiable-draw source hiccupped (e.g. many threads at once)
+                d = str(e)
+                break
+            ok, d = self.game.action("/game/attack/", **body)
+            if ok or d != "INVALID_ENTROPY" or stake <= 100:
+                break
+            stake = (stake * Decimal(7) / Decimal(10)).to_integral_value(rounding="ROUND_FLOOR")
         if not ok:
             self.log.append(f"attack failed: {d}")
+            # transient randomness-source error: not a real block — retry in a few minutes, not next claim
+            if "ENTROPY_SOURCE_UNAVAILABLE" in str(d):
+                self.waits.append((random.uniform(120, 300), "attack retry"))
             return False
         self.refresh()
         at = self.st.get("attack") or {}
@@ -382,6 +410,102 @@ class Tick:
                 self.log.append(str(e))
         return did
 
+    # --- level 2: blocks, extraction, super chip -----------------------------------------
+
+    def validate_block(self):
+        """Validate one block (POW solved server-side): a shield against network attacks + QE into the
+        cache. Costs the block's E. Called at claim time only, so the reward is claimed with the rest."""
+        if self.level < 2 or not config.GAME_VALIDATE_BLOCK:
+            return False
+        b = self.st.get("blocks") or {}
+        cost_e = _dec(b.get("cost_e"), Decimal(0))
+        e_now = _dec((self.st.get("entropy") or {}).get("amount_exact_e"), Decimal(0))
+        if e_now < cost_e:
+            return False
+        try:
+            aid = self.game.draw("block_validation")
+        except GameError as e:
+            self.log.append(f"block draw: {e}")
+            return False
+        ok, d = self.game.action("/game/blocks/validate/", action_id=aid, client_seed=secrets.token_hex(32))
+        if not ok:
+            self.log.append(f"block: {d}")
+            return False
+        self.merge(d)
+        recent = ((d.get("blocks") or {}).get("recent") or [None]) if isinstance(d, dict) else [None]
+        if recent and recent[0]:
+            self.log.append(f"⛏ block +{recent[0].get('reward_qe')}QE")
+        return True
+
+    def extract(self, item):
+        """Burn E for a discount on the next purchase of `item` (ready extraction only). The discount is
+        random and expires in ~30 min, so it is done right before buying. Refreshes to see the new price."""
+        if self.level < 2 or not config.GAME_EXTRACTION:
+            return False
+        ex = self.st.get("extraction") or {}
+        if ex.get("status") != "ready":
+            return False
+        if any(a.get("item") == item for a in (ex.get("active") or [])):
+            return False   # a discount for this part is already waiting — buy uses it, do not re-extract
+        tier = config.GAME_EXTRACTION_TIER
+        cost = next((_dec(t.get("cost_e")) for t in (ex.get("tiers") or []) if t.get("tier") == tier), None)
+        e_now = _dec((self.st.get("entropy") or {}).get("amount_exact_e"), Decimal(0))
+        if cost is None or e_now < cost:
+            return False
+        try:
+            aid = self.game.draw("extraction")
+        except GameError as e:
+            self.log.append(f"extraction draw: {e}")
+            return False
+        ok, d = self.game.action("/game/extractions/", action_id=aid, client_seed=secrets.token_hex(32),
+                                 item=item, tier=tier)
+        if not ok:
+            self.log.append(f"extraction: {d}")
+            return False
+        self.refresh()   # the discount changed next_cost_qe of the item
+        return True
+
+    def _level_of(self, name):
+        if name == "super_chip":
+            return (self.st.get("super_chip") or {}).get("level") or 0
+        return ((self.st.get("components") or {}).get(name) or {}).get("level") or 0
+
+    def _marginal_gain(self, name):
+        """Extra QE/s one more level of `name` would add. 0 for upgrades that do not raise production
+        (ram = cache size, validator = cheaper blocks, entropy = E/s), so ROI never picks them."""
+        per = float(_dec((self.st.get("super_chip") or {}).get("prod_per_level_qe"), Decimal(50)))
+        sc, pl = self._level_of("super_chip"), self._level_of("power_line")
+        cap, clk, pcie = self._level_of("capacitor"), self._level_of("clock"), self._level_of("pcie_bus")
+        # pcie: +3% per level for each part already at level >= 5
+        parts5 = sum(1 for n in ("super_chip", "capacitor", "power_line", "ram", "clock", "pcie_bus")
+                     if self._level_of(n) >= 5)
+        sc_base = sc * per
+        sc_prod = sc_base * (1 + 0.08 * pl)
+        pct = 0.05 * cap + 0.05 * clk + 0.03 * pcie * parts5
+        if name == "super_chip":
+            return per * (1 + 0.08 * pl) * (1 + pct)
+        if name == "power_line":
+            return sc_base * 0.08 * (1 + pct)
+        if name in ("capacitor", "clock"):
+            return sc_prod * 0.05
+        if name == "pcie_bus":
+            return sc_prod * 0.03 * parts5
+        return 0.0
+
+    def _target_roi(self, blocked):
+        """Level 2: the upgrade with the best QE/s gained per QE spent. Super chip wins early (it is the
+        base everything else multiplies); a component takes over once its %-bonus beats a chip level."""
+        opts = {n: o for n, o in self.options().items() if n not in blocked}
+        ranked = []
+        for name, (path, cost) in opts.items():
+            gain = self._marginal_gain(name)
+            if gain > 0 and cost > 0:
+                ranked.append((gain / float(cost), name, path, cost))
+        if ranked:
+            _, name, path, cost = max(ranked)
+            return (name, path, cost)
+        return ("super_chip", *opts["super_chip"]) if "super_chip" in opts else None
+
     # --- upgrades ------------------------------------------------------------------------
 
     def options(self):
@@ -393,8 +517,10 @@ class Tick:
             if cost is not None and (item.get(level_key) or 0) < (item.get("max_level") or 0):
                 out[name] = (path, cost)
 
-        add("chip", "/game/chip/purchase/", st.get("chip") or {})
-        add("entropy", "/game/entropy-module/purchase/", st.get("entropy") or {}, "module_level")
+        # a won attack retires the Level 1 chip and module (LEVEL_1_CLOSED): nothing to buy until the throne
+        if not (st.get("victory") or {}).get("completed_at"):
+            add("chip", "/game/chip/purchase/", st.get("chip") or {})
+            add("entropy", "/game/entropy-module/purchase/", st.get("entropy") or {}, "module_level")
         add("super_chip", "/game/super-chip/purchase/", st.get("super_chip") or {})
         for name, c in (st.get("components") or {}).items():
             if c.get("unlocked"):
@@ -402,9 +528,17 @@ class Tick:
         return out
 
     def target(self, blocked):
-        """The next upgrade to buy: chip up to GAME_ENTROPY_AT_CHIP, entropy module to max, chip to max,
-        then the cheapest of the rest. Returns (name, path, cost) or None."""
+        """The next upgrade to buy. Returns (name, path, cost) or None.
+        Level 2: best payback (ROI). Level 1: chip up to GAME_ENTROPY_AT_CHIP, entropy, chip, cheapest."""
+        if self.level >= 2:
+            return self._target_roi(blocked)
         opts = {n: o for n, o in self.options().items() if n not in blocked}
+        if self._attacking():
+            # the chip does not carry into Level 2: stop upgrading it once the attack is unlocked (chip 25),
+            # keep only the entropy module (which does carry) — QE then just waits for the attack
+            unlock = (self.st.get("attack") or {}).get("unlock_chip_level") or 25
+            if self.chip_level() >= unlock:
+                opts.pop("chip", None)
         if "chip" in opts and self.chip_level() < config.GAME_ENTROPY_AT_CHIP:
             return ("chip", *opts["chip"])
         for name in ("entropy", "chip"):
@@ -424,6 +558,14 @@ class Tick:
             if t is None:
                 return None
             name, path, cost = t
+            # L2: one discount extraction on the super chip right before buying it (lowers its price).
+            # Only when it is actually affordable this visit, so the discount is not wasted (expires ~30 min)
+            if name == "super_chip" and self.level >= 2 and not self._extracted:
+                amount, _, _ = self.cache()
+                if self.available + amount.to_integral_value(rounding="ROUND_FLOOR") >= cost:
+                    self._extracted = True
+                    if self.extract("super_chip"):
+                        continue   # re-evaluate with the discounted next_cost
             if self.available < cost:
                 amount, _, _ = self.cache()
                 if self.available + amount.to_integral_value(rounding="ROUND_FLOOR") < cost or not self.claim():
@@ -449,17 +591,18 @@ class Tick:
     # --- the visit -----------------------------------------------------------------------
 
     def claim_level(self):
-        """Cache amount from which it is claimed anyway: GAME_CLAIM_BEFORE_FULL_MIN before it is full."""
+        """Cache amount from which it is claimed anyway: claim_margin_min minutes before it is full."""
         _, capacity, prod = self.cache()
-        return max(Decimal(0), capacity - prod * config.GAME_CLAIM_BEFORE_FULL_MIN * 60)
+        return max(Decimal(0), capacity - prod * Decimal(self.claim_margin_min) * 60)
 
     def run(self):
         amount, capacity, _ = self.cache()
         if capacity > 0 and amount >= self.claim_level():
+            self.validate_block()   # L2: shield + reward into the cache, then claim takes it all
             self.claim()
         waiting_for = None
         for _ in range(5):   # an upgrade may unlock a trial, a trial may unlock an upgrade
-            did = self.trials()
+            did = self.trials() if self.level < 2 else False   # L1 trials only; L2 has no such trials
             before = sum(self.bought.values())
             waiting_for = self.upgrades() if config.GAME_UPGRADE else None
             if not did and sum(self.bought.values()) == before:
@@ -473,21 +616,31 @@ class Tick:
         amount, capacity, prod = self.cache()
         waits = [(s + config.GAME_MARGIN_SEC, why) for s, why in self.waits]
         if prod > 0:
-            level = self.claim_level()
+            claim_at = self.claim_level()
             # the claim before the cache is full: no margin on top, better a bit early than full
-            waits.append((max(0.0, float((level - amount) / prod)),
-                          f"claim {config.GAME_CLAIM_BEFORE_FULL_MIN}m before full"))
+            waits.append((max(0.0, float((claim_at - amount) / prod)),
+                          f"claim {self.claim_margin_min:.0f}m before full"))
             if waiting_for:
                 name, _, cost = waiting_for
                 need = cost - self.available - amount
-                if need <= level - amount:   # reachable before that claim
+                if need <= claim_at - amount:   # reachable before that claim
                     waits.append((max(0.0, float(need / prod)) + config.GAME_MARGIN_SEC, f"{name} {cost}QE"))
         sec, why = min(waits, key=lambda w: w[0]) if waits else (MAX_WAIT, "nothing to do")
         return min(MAX_WAIT, max(MIN_WAIT, sec)), why
 
     def summary(self):
-        chip, ent = self.st.get("chip") or {}, self.st.get("entropy") or {}
         _, _, prod = self.cache()
+        if self.level >= 2:
+            sc = self.st.get("super_chip") or {}
+            ent = self.st.get("entropy") or {}
+            return (f"L2 super {sc.get('level')}/{sc.get('max_level')} ({prod.normalize()} QE/s) | "
+                    f"E {ent.get('amount_e')} | qe {self.st.get('qe_balance')}")
+        vic = self.st.get("victory") or {}
+        if vic.get("completed_at"):   # attack won, waiting for the throne: E/module are held in carry_over
+            co = vic.get("carry_over") or {}
+            return (f"L1 won → throne | carry E {co.get('entropy_e')} module {co.get('module_level')} "
+                    f"cache {co.get('cache_qe')} | qe {self.st.get('qe_balance')}")
+        chip, ent = self.st.get("chip") or {}, self.st.get("entropy") or {}
         return (f"chip {chip.get('level')}/{chip.get('max_level')} ({prod.normalize()} QE/s) | "
                 f"E {ent.get('amount_e')} (module {ent.get('module_level')}/{ent.get('max_level')}) | "
                 f"qe {self.st.get('qe_balance')}")
