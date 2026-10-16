@@ -623,8 +623,12 @@ class Tick:
             if waiting_for:
                 name, _, cost = waiting_for
                 need = cost - self.available - amount
-                if need <= claim_at - amount:   # reachable before that claim
-                    waits.append((max(0.0, float(need / prod)) + config.GAME_MARGIN_SEC, f"{name} {cost}QE"))
+                if need <= claim_at - amount:   # reachable before the claim (min() below caps it at the claim)
+                    # L2: come back for the upgrade a random 1-15 min after enough QE (sooner than the claim,
+                    # so growth compounds faster); L1 keeps the fixed margin
+                    margin = (random.uniform(*config.GAME_L2_UPGRADE_JITTER) * 60
+                              if self.level >= 2 else config.GAME_MARGIN_SEC)
+                    waits.append((max(0.0, float(need / prod)) + margin, f"{name} {cost}QE"))
         sec, why = min(waits, key=lambda w: w[0]) if waits else (MAX_WAIT, "nothing to do")
         return min(MAX_WAIT, max(MIN_WAIT, sec)), why
 
