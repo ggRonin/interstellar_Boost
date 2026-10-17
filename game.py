@@ -473,27 +473,38 @@ class Tick:
             return (self.st.get("super_chip") or {}).get("level") or 0
         return ((self.st.get("components") or {}).get(name) or {}).get("level") or 0
 
+    PCIE_PARTS = ("super_chip", "capacitor", "power_line", "ram", "clock", "pcie_bus")
+    PCIE_THRESHOLD = 5
+
     def _marginal_gain(self, name):
         """Extra QE/s one more level of `name` would add. 0 for upgrades that do not raise production
-        (ram = cache size, validator = cheaper blocks, entropy = E/s), so ROI never picks them."""
+        (validator = cheaper blocks, entropy = E/s), so ROI never picks them.
+        A part below PCIE's level-5 threshold also gets credit for the PCIE production it will unlock once
+        it reaches 5 (amortized over the levels to get there), so the picker climbs cheap parts — e.g. RAM —
+        to 5 when PCIE makes it worthwhile; without this the greedy ROI would never reach the threshold."""
         per = float(_dec((self.st.get("super_chip") or {}).get("prod_per_level_qe"), Decimal(50)))
         sc, pl = self._level_of("super_chip"), self._level_of("power_line")
         cap, clk, pcie = self._level_of("capacitor"), self._level_of("clock"), self._level_of("pcie_bus")
         # pcie: +3% per level for each part already at level >= 5
-        parts5 = sum(1 for n in ("super_chip", "capacitor", "power_line", "ram", "clock", "pcie_bus")
-                     if self._level_of(n) >= 5)
+        parts5 = sum(1 for n in self.PCIE_PARTS if self._level_of(n) >= self.PCIE_THRESHOLD)
         sc_base = sc * per
         sc_prod = sc_base * (1 + 0.08 * pl)
         pct = 0.05 * cap + 0.05 * clk + 0.03 * pcie * parts5
         if name == "super_chip":
-            return per * (1 + 0.08 * pl) * (1 + pct)
-        if name == "power_line":
-            return sc_base * 0.08 * (1 + pct)
-        if name in ("capacitor", "clock"):
-            return sc_prod * 0.05
-        if name == "pcie_bus":
-            return sc_prod * 0.03 * parts5
-        return 0.0
+            gain = per * (1 + 0.08 * pl) * (1 + pct)
+        elif name == "power_line":
+            gain = sc_base * 0.08 * (1 + pct)
+        elif name in ("capacitor", "clock"):
+            gain = sc_prod * 0.05
+        elif name == "pcie_bus":
+            gain = sc_prod * 0.03 * parts5
+        else:
+            gain = 0.0
+        # PCIE threshold look-ahead: bringing this part to level 5 adds +3%*pcie to every tick
+        if (config.GAME_PCIE_LOOKAHEAD and pcie > 0 and name in self.PCIE_PARTS
+                and self._level_of(name) < self.PCIE_THRESHOLD):
+            gain += sc_prod * 0.03 * pcie / (self.PCIE_THRESHOLD - self._level_of(name))
+        return gain
 
     def _target_roi(self, blocked):
         """Level 2: the upgrade with the best QE/s gained per QE spent. Super chip wins early (it is the
