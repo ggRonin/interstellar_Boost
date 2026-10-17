@@ -413,9 +413,9 @@ class Tick:
     # --- level 2: blocks, extraction, super chip -----------------------------------------
 
     def validate_block(self):
-        """Validate one block (POW solved server-side): a shield against network attacks + QE into the
-        cache. Costs the block's E. Called at claim time only, so the reward is claimed with the rest."""
-        if self.level < 2 or not config.GAME_VALIDATE_BLOCK:
+        """Validate one block (POW solved server-side): a shield against attacks + QE into the cache.
+        Costs the block's E. Callers gate it (claim time, or sentinel-wave defence)."""
+        if self.level < 2:
             return False
         b = self.st.get("blocks") or {}
         cost_e = _dec(b.get("cost_e"), Decimal(0))
@@ -436,6 +436,25 @@ class Tick:
         if recent and recent[0]:
             self.log.append(f"⛏ block +{recent[0].get('reward_qe')}QE")
         return True
+
+    def defend_sentinel(self):
+        """While a sentinel wave is active (super chip 20/30), keep a block shield up so each strike is
+        repelled (held +1 toward beating the wave) instead of landing on the cache. Strikes are the same
+        stream as network attacks; a shield up at the landing repels one strike and is used up.
+        Returns the wave's strike interval (sec) so the visit is rescheduled before the next strike."""
+        if self.level < 2 or not config.GAME_SENTINEL_DEFEND:
+            return None
+        se = self.st.get("sentinels") or {}
+        if se.get("status") != "active" or se.get("all_beaten"):
+            return None
+        b = self.st.get("blocks") or {}
+        # raise a shield if none covers the next strike (or the game says a strike is incoming unshielded)
+        if se.get("waiting_for_shield") or _left(b.get("shield_until")) < 90:
+            if self.validate_block():
+                self.log.append("🛡 sentinel shield")
+        wave = next((w for w in (se.get("waves") or []) if w.get("wave") == se.get("active")), None)
+        iv = (wave or {}).get("interval") or {}
+        return float(iv.get("min_sec") or 600)
 
     def extract(self, item):
         """Burn E for a discount on the next purchase of `item` (ready extraction only). The discount is
@@ -611,9 +630,11 @@ class Tick:
         return max(Decimal(0), capacity - prod * Decimal(self.claim_margin_min) * 60)
 
     def run(self):
+        sentinel_iv = self.defend_sentinel()   # L2: hold a shield while a sentinel wave is active
         amount, capacity, _ = self.cache()
         if capacity > 0 and amount >= self.claim_level():
-            self.validate_block()   # L2: shield + reward into the cache, then claim takes it all
+            if config.GAME_VALIDATE_BLOCK:
+                self.validate_block()   # L2: shield + reward into the cache, then claim takes it all
             self.claim()
         waiting_for = None
         for _ in range(5):   # an upgrade may unlock a trial, a trial may unlock an upgrade
@@ -624,12 +645,14 @@ class Tick:
                 break
         if self.bought:
             self.refresh()
-        return self.plan(waiting_for)
+        return self.plan(waiting_for, sentinel_iv)
 
-    def plan(self, waiting_for):
+    def plan(self, waiting_for, sentinel_iv=None):
         """Seconds until the next visit + why."""
         amount, capacity, prod = self.cache()
         waits = [(s + config.GAME_MARGIN_SEC, why) for s, why in self.waits]
+        if sentinel_iv:   # a wave is active: come back before the next strike to re-raise the shield
+            waits.append((random.uniform(0.4, 0.7) * sentinel_iv, "sentinel defend"))
         if prod > 0:
             claim_at = self.claim_level()
             # the claim before the cache is full: no margin on top, better a bit early than full
