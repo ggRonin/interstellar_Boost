@@ -445,8 +445,11 @@ class Tick:
         ex = self.st.get("extraction") or {}
         if ex.get("status") != "ready":
             return False
+        info = next((i for i in (ex.get("items") or []) if i.get("item") == item), None)
+        if info is not None and not info.get("eligible"):
+            return False   # part locked, or a discount for it is already waiting (reason "active")
         if any(a.get("item") == item for a in (ex.get("active") or [])):
-            return False   # a discount for this part is already waiting — buy uses it, do not re-extract
+            return False
         tier = config.GAME_EXTRACTION_TIER
         cost = next((_dec(t.get("cost_e")) for t in (ex.get("tiers") or []) if t.get("tier") == tier), None)
         e_now = _dec((self.st.get("entropy") or {}).get("amount_exact_e"), Decimal(0))
@@ -558,13 +561,14 @@ class Tick:
             if t is None:
                 return None
             name, path, cost = t
-            # L2: one discount extraction on the super chip right before buying it (lowers its price).
-            # Only when it is actually affordable this visit, so the discount is not wasted (expires ~30 min)
-            if name == "super_chip" and self.level >= 2 and not self._extracted:
+            # L2: one discount extraction on the part we're about to buy (whatever it is), right before
+            # buying — lowers its price. Only when it's actually affordable this visit, so the discount is
+            # not wasted (it expires ~30 min). Tier from config (high = best odds of a big discount).
+            if self.level >= 2 and config.GAME_EXTRACTION and not self._extracted:
                 amount, _, _ = self.cache()
                 if self.available + amount.to_integral_value(rounding="ROUND_FLOOR") >= cost:
                     self._extracted = True
-                    if self.extract("super_chip"):
+                    if self.extract(name):
                         continue   # re-evaluate with the discounted next_cost
             if self.available < cost:
                 amount, _, _ = self.cache()
