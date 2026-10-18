@@ -438,23 +438,24 @@ class Tick:
         return True
 
     def defend_sentinel(self):
-        """While a sentinel wave is active (super chip 20/30), keep a block shield up so each strike is
-        repelled (held +1 toward beating the wave) instead of landing on the cache. Strikes are the same
-        stream as network attacks; a shield up at the landing repels one strike and is used up.
-        Returns the wave's strike interval (sec) so the visit is rescheduled before the next strike."""
+        """Beat an active sentinel wave (super chip 20/30). A sentinel strikes ONLY while your shield is
+        down ("strikes once your shield has expired") — a standing shield blocks the strike from ever
+        coming, so the wave stalls. The right play: leave the shield down, wait for the strike to be
+        announced (incoming), then raise a block shield within the landing window so it is repelled
+        (held +1) and immediately used up. Returns a short revisit interval to catch the next window."""
         if self.level < 2 or not config.GAME_SENTINEL_DEFEND:
             return None
         se = self.st.get("sentinels") or {}
         if se.get("status") != "active" or se.get("all_beaten"):
             return None
-        # Always refresh the shield on every visit while a wave is active: a block also pays ~1620 QE,
-        # so there is no downside, and a fresh shield is always ready for the next strike (which consumes
-        # it). Combined with frequent revisits below, this catches the strikes reliably.
-        if self.validate_block():
-            self.log.append("🛡 sentinel shield")
-        wave = next((w for w in (se.get("waves") or []) if w.get("wave") == se.get("active")), None)
-        iv = (wave or {}).get("interval") or {}
-        return float(iv.get("min_sec") or 600)
+        na = self.st.get("network_attacks") or {}
+        if na.get("warning"):   # a strike is incoming -> raise a shield now to repel it (do NOT pre-shield)
+            if self.validate_block():
+                self.log.append("🛡 sentinel repel")
+            return 15.0
+        # no strike incoming: keep the shield DOWN so the sentinel will strike; check back often (the
+        # landing window is short, ~1 min) to catch the next announcement
+        return 40.0
 
     def assault(self):
         """Network Assault — the Level 2 boss, after all three sentinel waves are beaten. Build a streak by
