@@ -174,8 +174,10 @@ class Tick:
         self.claimed = Decimal(0)
         self.spent = Decimal(0)
         self.bought = {}
-        # claim a random 10-30 min before the cache is full (same figure for this whole visit)
+        # claim a random 10-30 min before the cache is full (L1; same figure for this whole visit)
         self.claim_margin_min = random.uniform(*config.GAME_CLAIM_MARGIN)
+        # L2: claim at a random 85-95% of capacity ("within 5-15% of full"), same figure for the visit
+        self.claim_pct = random.uniform(*config.GAME_CLAIM_PCT)
         self._extracted = False   # one discount extraction per visit (cooldown 120 s)
 
     # --- state helpers -------------------------------------------------------------------
@@ -437,6 +439,27 @@ class Tick:
             self.log.append(f"⛏ block +{recent[0].get('reward_qe')}QE")
         return True
 
+    def block_farm(self):
+        """L2 leaderboard climb. A validated block drops a FIXED bonus into the cache (~2M QE for ~24 E),
+        independent of production; claiming empties the cache so the next block's bonus lands in full. ONE
+        validate+claim per visit — never a tight loop (a per-second cadence is an obvious bot, like the WS
+        403). Revisit on a randomised human interval; if production fills the cache sooner, plan() brings the
+        visit forward on the claim instead. Returns the revisit interval in seconds (None -> normal cycle)."""
+        if self.level < 2 or not config.GAME_BLOCK_FARM:
+            return None
+        b = self.st.get("blocks") or {}
+        cost_e = _dec(b.get("cost_e"), Decimal(0))
+        e_now = _dec((self.st.get("entropy") or {}).get("amount_exact_e"), Decimal(0))
+        if e_now < cost_e:   # no E for a block: fall back to the normal claim cycle
+            return None
+        amount, capacity, _ = self.cache()
+        # claim first if the cache is already near full, so the block's bonus does not overflow and waste
+        if capacity > 0 and amount >= self.claim_level():
+            self.claim()
+        if self.validate_block():   # +fixed bonus into the (now emptier) cache, shields ~30 min
+            self.claim()            # take the bonus (plus whatever production piled up)
+        return random.uniform(*config.GAME_BLOCK_REVISIT_MIN) * 60
+
     def defend_sentinel(self):
         """Beat an active sentinel wave (super chip 20/30). A sentinel strikes ONLY while your shield is
         down ("strikes once your shield has expired") — a standing shield blocks the strike from ever
@@ -694,22 +717,28 @@ class Tick:
     # --- the visit -----------------------------------------------------------------------
 
     def claim_level(self):
-        """Cache amount from which it is claimed anyway: claim_margin_min minutes before it is full."""
+        """Cache amount from which it is claimed anyway. L2: a random 85-95% of capacity ("within 5-15% of
+        full"). L1: claim_margin_min minutes before it is full."""
         _, capacity, prod = self.cache()
+        if self.level >= 2:
+            return capacity * Decimal(str(self.claim_pct))
         return max(Decimal(0), capacity - prod * Decimal(self.claim_margin_min) * 60)
 
     def run(self):
         # L2: defend sentinel waves; once they are all beaten, run the Network Assault boss
-        extra_iv = None
+        extra_iv = farmed = None
         if self.level >= 2:
             extra_iv = self.defend_sentinel()
             if extra_iv is None:
                 extra_iv = self.assault()
-        amount, capacity, _ = self.cache()
-        if capacity > 0 and amount >= self.claim_level():
-            if config.GAME_VALIDATE_BLOCK:
-                self.validate_block()   # L2: shield + reward into the cache, then claim takes it all
-            self.claim()
+            if extra_iv is None:
+                extra_iv = farmed = self.block_farm()   # farms + claims at the % threshold on its own
+        if farmed is None:   # block_farm did not run: do the normal claim-at-threshold
+            amount, capacity, _ = self.cache()
+            if capacity > 0 and amount >= self.claim_level():
+                if config.GAME_VALIDATE_BLOCK:
+                    self.validate_block()   # L2: shield + reward into the cache, then claim takes it all
+                self.claim()
         waiting_for = None
         for _ in range(5):   # an upgrade may unlock a trial, a trial may unlock an upgrade
             did = self.trials() if self.level < 2 else False   # L1 trials only; L2 has no such trials
@@ -719,19 +748,22 @@ class Tick:
                 break
         if self.bought:
             self.refresh()
-        return self.plan(waiting_for, extra_iv)
+        return self.plan(waiting_for, extra_iv, farm_iv=farmed)
 
-    def plan(self, waiting_for, extra_iv=None):
+    def plan(self, waiting_for, extra_iv=None, farm_iv=None):
         """Seconds until the next visit + why."""
         amount, capacity, prod = self.cache()
         waits = [(s + config.GAME_MARGIN_SEC, why) for s, why in self.waits]
-        if extra_iv:   # a sentinel wave / assault is in progress: come back soon to keep the shield / streak
+        if extra_iv and farm_iv is None:   # a sentinel wave / assault is in progress: come back soon
             waits.append((random.uniform(0.3, 0.5) * extra_iv, "sentinel/assault"))
+        if farm_iv:   # block farming: revisit on the full (jittered) interval, not sooner
+            waits.append((farm_iv, "block farm"))
         if prod > 0:
             claim_at = self.claim_level()
+            why_claim = (f"claim at {self.claim_pct * 100:.0f}% full" if self.level >= 2
+                         else f"claim {self.claim_margin_min:.0f}m before full")
             # the claim before the cache is full: no margin on top, better a bit early than full
-            waits.append((max(0.0, float((claim_at - amount) / prod)),
-                          f"claim {self.claim_margin_min:.0f}m before full"))
+            waits.append((max(0.0, float((claim_at - amount) / prod)), why_claim))
             if waiting_for:
                 name, _, cost = waiting_for
                 need = cost - self.available - amount
