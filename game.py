@@ -447,11 +447,11 @@ class Tick:
         se = self.st.get("sentinels") or {}
         if se.get("status") != "active" or se.get("all_beaten"):
             return None
-        b = self.st.get("blocks") or {}
-        # raise a shield if none covers the next strike (or the game says a strike is incoming unshielded)
-        if se.get("waiting_for_shield") or _left(b.get("shield_until")) < 90:
-            if self.validate_block():
-                self.log.append("🛡 sentinel shield")
+        # Always refresh the shield on every visit while a wave is active: a block also pays ~1620 QE,
+        # so there is no downside, and a fresh shield is always ready for the next strike (which consumes
+        # it). Combined with frequent revisits below, this catches the strikes reliably.
+        if self.validate_block():
+            self.log.append("🛡 sentinel shield")
         wave = next((w for w in (se.get("waves") or []) if w.get("wave") == se.get("active")), None)
         iv = (wave or {}).get("interval") or {}
         return float(iv.get("min_sec") or 600)
@@ -651,8 +651,8 @@ class Tick:
         """Seconds until the next visit + why."""
         amount, capacity, prod = self.cache()
         waits = [(s + config.GAME_MARGIN_SEC, why) for s, why in self.waits]
-        if sentinel_iv:   # a wave is active: come back before the next strike to re-raise the shield
-            waits.append((random.uniform(0.4, 0.7) * sentinel_iv, "sentinel defend"))
+        if sentinel_iv:   # a wave is active: come back well before the next strike to keep a shield up
+            waits.append((random.uniform(0.3, 0.5) * sentinel_iv, "sentinel defend"))
         if prod > 0:
             claim_at = self.claim_level()
             # the claim before the cache is full: no margin on top, better a bit early than full
