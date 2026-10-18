@@ -166,7 +166,7 @@ class Game:
 class Tick:
     """One visit of an account: claim / trials / upgrades, then when to come back."""
 
-    def __init__(self, session):
+    def __init__(self, session, block_farm=False):
         self.game = Game(session)
         self.st = self.game.state()
         self.log = []
@@ -174,6 +174,7 @@ class Tick:
         self.claimed = Decimal(0)
         self.spent = Decimal(0)
         self.bought = {}
+        self._farm_enabled = block_farm   # aggressive block farming on for this account (per GAME_BLOCK_FARM)
         # claim a random 10-30 min before the cache is full (L1; same figure for this whole visit)
         self.claim_margin_min = random.uniform(*config.GAME_CLAIM_MARGIN)
         # L2: claim at a random 85-95% of capacity ("within 5-15% of full"), same figure for the visit
@@ -445,7 +446,7 @@ class Tick:
         validate+claim per visit — never a tight loop (a per-second cadence is an obvious bot, like the WS
         403). Revisit on a randomised human interval; if production fills the cache sooner, plan() brings the
         visit forward on the claim instead. Returns the revisit interval in seconds (None -> normal cycle)."""
-        if self.level < 2 or not config.GAME_BLOCK_FARM:
+        if self.level < 2 or not self._farm_enabled:
             return None
         b = self.st.get("blocks") or {}
         cost_e = _dec(b.get("cost_e"), Decimal(0))
@@ -794,8 +795,27 @@ class Tick:
                 f"qe {self.st.get('qe_balance')}")
 
 
+_FARM_ADDRS = set()   # lowercased addresses with aggressive block farming on (filled by main via config)
+
+
+def farm_addresses(wallets):
+    """Addresses for which aggressive block farming is on. config.GAME_BLOCK_FARM is 0 (off), 1 (all L2),
+    or a list of 1-based positions in the account list — so a specific account is picked without any
+    address going into the committed config."""
+    bf = config.GAME_BLOCK_FARM
+    if not bf:
+        return set()
+    if bf is True or bf == 1:
+        return {w["address"].lower() for w in wallets}
+    picked = set()
+    for pos in bf:   # 1-based positions, in file order
+        if isinstance(pos, int) and 1 <= pos <= len(wallets):
+            picked.add(wallets[pos - 1]["address"].lower())
+    return picked
+
+
 def game_job(siwe):
-    t = Tick(siwe.session)
+    t = Tick(siwe.session, block_farm=siwe.address.lower() in _FARM_ADDRS)
     wait_sec, why = t.run()
     parts = []
     if t.claimed:
@@ -882,8 +902,11 @@ def main():
     pool = ProxyPool(config.PROXY_FILE)
     sched = Schedule(config.GAME_SCHEDULE_FILE)
     by_addr = {w["address"]: w for w in wallets}
+    global _FARM_ADDRS
+    _FARM_ADDRS = farm_addresses(wallets)
     now = time.time()
-    print(f"[*] Game - {desc} | {config.GAME_THREADS} threads | {pool.remaining()} spare proxies")
+    farm_note = f" | block farm: {len(_FARM_ADDRS)} acct(s)" if _FARM_ADDRS else ""
+    print(f"[*] Game - {desc} | {config.GAME_THREADS} threads | {pool.remaining()} spare proxies{farm_note}")
     print(f"[*] {sum(1 for a in by_addr if sched.due_at(a) <= now)} due now, schedule in "
           f"{config.GAME_SCHEDULE_FILE} | Ctrl+C to stop\n")
 
