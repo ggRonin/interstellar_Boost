@@ -74,6 +74,7 @@ EXTRACTION = True            # L2: burn E for a discount on the part about to be
 EXTRACTION_TIER = "high"     # base / medium / high (best odds of a big discount)
 PCIE_LOOKAHEAD = True        # L2: climb cheap parts to 5 for the PCIE multiplier
 HEAT_SAFETY = 0.95           # L3: don't push heat past this fraction of the limit
+QUANTUM_PAYBACK_HOURS = 24    # L3: buy a quantum-chip level when its cost pays back (via its discount) within this
 MARGIN_SEC = 120             # slack added to a computed revisit time
 UPGRADE_JITTER = (1, 10)     # min: when enough QE for an upgrade, revisit a random 1-10 min later
 CLAIM_PCT = (0.75, 1.0)      # claim when the cache is this fraction full (random per visit, all levels)
@@ -570,10 +571,43 @@ class Tick:
                 add(name, f"/game/components/{name}/purchase/", c)
         return out
 
+    def _quantum_target(self, opts):
+        """Level 3: the quantum chip discounts every OTHER part by 3%/level (up to 30%) while coherence is
+        high; the cryostat keeps coherence high (recovery vs a steady decay). Buy the cryostat first so
+        recovery beats decay (else the discount lapses between visits), then buy a quantum-chip level while
+        its cost pays back through the discount within QUANTUM_PAYBACK_HOURS of spending. Returns a target."""
+        if self.level < 3:
+            return None
+        q = self.st.get("quantum") or {}
+        qc = ((self.st.get("components") or {}).get("quantum_chip")) or {}
+        cryo = ((self.st.get("components") or {}).get("cryostat")) or {}
+        _, _, prod = self.cache()
+        p = float(prod)
+        if p <= 0:
+            return None
+        decay = float(_dec(q.get("decay_per_min"), Decimal(2)))
+        # 1) once the quantum chip is on, keep coherence net-positive with the cryostat
+        if (qc.get("level") or 0) > 0 and "cryostat" in opts:
+            per_lvl = float(_dec((cryo.get("effect") or {}).get("recovery_per_level_per_min"), Decimal("0.5")))
+            if per_lvl * (cryo.get("level") or 0) <= decay:
+                return ("cryostat", *opts["cryostat"])
+        # 2) buy a quantum-chip level while it pays back fast enough through the discount on future buys
+        if "quantum_chip" in opts:
+            cost = float(opts["quantum_chip"][1])
+            per = float(_dec((qc.get("effect") or {}).get("discount_per_level"), Decimal("0.03")))
+            if per > 0 and cost / (per * p) <= QUANTUM_PAYBACK_HOURS * 3600:
+                return ("quantum_chip", *opts["quantum_chip"])
+        return None
+
     def target(self, blocked):
         """The next upgrade to buy. Returns (name, path, cost) or None.
-        Level 2: best payback (ROI). Level 1: chip up to GAME_ENTROPY_AT_CHIP, entropy, chip, cheapest."""
+        Level 3: quantum chip/cryostat when they pay back, else best production ROI. Level 2: best ROI.
+        Level 1: chip up to ENTROPY_AT_CHIP, entropy, chip, cheapest."""
         if self.level >= 2:
+            if self.level >= 3:
+                q = self._quantum_target({n: o for n, o in self.options().items() if n not in blocked})
+                if q is not None:
+                    return q
             return self._target_roi(blocked)
         opts = {n: o for n, o in self.options().items() if n not in blocked}
         if self._attacking():
