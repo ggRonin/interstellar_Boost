@@ -771,9 +771,6 @@ class Schedule:
     def due_at(self, addr):
         return (self.data.get(addr.lower()) or {}).get("next_at", 0)
 
-    def level(self, addr):
-        return (self.data.get(addr.lower()) or {}).get("level")
-
     def set(self, addr, next_at, **info):
         with self.lock:
             self.data[addr.lower()] = {"next_at": next_at,
@@ -808,16 +805,11 @@ def main():
                 elif not running:
                     time.sleep(config.GAME_NET_WAIT_SEC)   # offline: re-check every GAME_NET_WAIT_SEC
                     continue
+            free = config.THREADS - len(running)
             busy = set(running.values())
             due = sorted((sched.due_at(a), a) for a in by_addr if a not in busy and sched.due_at(a) <= now)
             if not net_trouble:   # offline: let the in-flight ones finish, start nothing new
-                for _, addr in due:
-                    if len(running) >= config.THREADS:
-                        break
-                    lvl = sched.level(addr)
-                    if lvl is not None and not level_on(lvl):   # this level disabled -> park, don't touch it
-                        sched.set(addr, now + SKIP_WAIT, why="level off", level=lvl)
-                        continue
+                for _, addr in due[:free]:
                     running[ex.submit(with_session, game_job, by_addr[addr], pool, wallet_file)] = addr
 
             if not running:
