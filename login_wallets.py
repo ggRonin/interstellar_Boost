@@ -402,6 +402,35 @@ def daily_checkin(session):
     return {"done": True, "streak": d.get("streak"), "reward": st.get("daily_reward")}
 
 
+def mint_badges(session):
+    """Mint earned weekly check-in badges. Every 7 days of streak unlocks a badge worth badge_reward QE
+    plus an on-chain NFT; minting is gasless (the operator submits the tx: state goes unlocked -> minting
+    -> minted, and the QE is credited on completion). Only "unlocked" badges are minted; "minting"/"minted"/
+    "locked" are skipped. Each mint needs its own captcha, so a captcha is solved only per unlocked badge,
+    and not at all when there is nothing to mint. Returns a summary."""
+    st = session.get(CHECKIN_ENDPOINT, timeout=config.API_TIMEOUT).json().get("data") or {}
+    unlocked = [b for b in (st.get("badges") or []) if b.get("state") == "unlocked"]
+    if not st.get("badge_mint_available") or not unlocked:
+        return {"minted": [], "failed": []}
+    minted, failed = [], []
+    for b in unlocked:
+        week = b.get("week")
+        headers = {"X-CSRFToken": session.cookies.get("csrftoken"), "Referer": f"{config.BASE_URL}/",
+                   "X-Captcha-Token": cap.solve(session)}
+        r = session.post(f"{CHECKIN_ENDPOINT}badges/{week}/mint/", json={}, headers=headers,
+                         timeout=config.API_TIMEOUT)
+        try:
+            body = r.json()
+        except ValueError:
+            failed.append(f"w{week}:{r.status_code}")
+            continue
+        if r.status_code in (200, 201) and body.get("success"):
+            minted.append(f"w{week}+{b.get('reward')}QE")
+        else:
+            failed.append(f"w{week}:{(body.get('error') or {}).get('code', r.status_code)}")
+    return {"minted": minted, "failed": failed}
+
+
 def process(idx, proxy, seed, address, token, pool, results, store):
     if results.is_done(address):
         return {"address": address, "ok": True, "skipped": True}
@@ -429,11 +458,13 @@ def process(idx, proxy, seed, address, token, pool, results, store):
             store.update(address, proxy, token)
             checkin = daily_checkin(siwe.session) if config.CHECKIN else None
             quests = do_quests(siwe.session) if config.QUESTS else None
+            badges = mint_badges(siwe.session) if config.BADGES else None
             chest = open_chests(siwe.session, config.OPEN_BOX) if config.OPEN_BOX > 0 else None
             rec = {
                 "ok": True, "address": siwe.address, "via": via,
                 "user_id": user.get("id"), "status": user.get("status"),
                 "created": created, "proxy": proxy, "checkin": checkin, "quests": quests,
+                "badges": badges,
             }
             if chest:
                 rec.update(opened=chest["opened"], rewards=chest["rewards"], qe_final=chest["qe_final"])
@@ -478,6 +509,12 @@ def _print_result(res, addr, done, total):
             parts.append("📋 " + ", ".join(q["done"]))
         if q.get("failed"):
             parts.append("quests failed: " + ", ".join(q["failed"]))
+    bd = res.get("badges")
+    if bd:
+        if bd.get("minted"):
+            parts.append("🏅 minted " + ", ".join(bd["minted"]))
+        if bd.get("failed"):
+            parts.append("badges failed: " + ", ".join(bd["failed"]))
     if "opened" in res:
         opened = res.get("opened", 0)
         drops = " + ".join(f"{(x or {}).get('reward_qe', '?')}QE"
