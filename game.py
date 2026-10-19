@@ -22,7 +22,7 @@ qe_balance. One visit ("tick") of an account:
 The next visit of every account is kept in GAME_SCHEDULE_FILE, so a restart goes on where it stopped;
 GAME_THREADS accounts are handled at once, while the others wait for their time.
 
-Wallets — config.GAME_SOURCE: 1 Accounts.txt, 2 Boost.txt, 3 Wallet.txt (only ",done" wallets).
+Wallets — SOURCE: 1 Accounts.txt, 2 Boost.txt, 3 Wallet.txt (only ",done" wallets).
 Sessions and proxies as in Boost.py: the saved session is reused (no captcha), otherwise a SIWE login;
 a dead proxy is replaced by the next one from Proxy.txt and written into the wallet's line.
 The first game request asks for a human check: POST /game/session/ with a Cap.js captcha -> a game
@@ -59,6 +59,30 @@ MAX_PURCHASES = 500        # per tick, a guard against a loop on a broken state
 MIN_WAIT = 60              # s, the shortest pause between two visits of an account
 MAX_WAIT = 6 * 3600        # s, the longest one (nothing to wait for: re-check now and then)
 FIREWALL_TRIES = 3
+
+# --- game tuning (config keeps only LVL1/2/3 + THREADS; everything else is baked in here) ---
+SOURCE = 1                   # wallet source: 1 Accounts.txt, 2 Boost.txt, 3 Wallet.txt
+SCHEDULE_FILE = "game_schedule.json"
+SKIP_WAIT = 6 * 3600         # a disabled-level account: re-check at most this often
+UPGRADE = True               # buy upgrades while QE allows
+TRIALS = True                # L1 trials (Bus Guardian, Private Key, Firewall)
+ATTACK = True                # L1 attack (ends level 1); staked E capped near 90%
+ATTACK_ENTROPY = 1466        # E staked on the attack (the game caps it ~1466 = 90%)
+ENTROPY_AT_CHIP = 20         # L1: chip to this, then module to max, then chip to max
+QE_RESERVE = 0               # keep this much QE on the balance, never spend below it
+EXTRACTION = True            # L2: burn E for a discount on the part about to be bought
+EXTRACTION_TIER = "high"     # base / medium / high (best odds of a big discount)
+PCIE_LOOKAHEAD = True        # L2: climb cheap parts to 5 for the PCIE multiplier
+HEAT_SAFETY = 0.95           # L3: don't push heat past this fraction of the limit
+MARGIN_SEC = 120             # slack added to a computed revisit time
+UPGRADE_JITTER = (1, 10)     # min: when enough QE for an upgrade, revisit a random 1-10 min later
+CLAIM_PCT = (0.75, 1.0)      # claim when the cache is this fraction full (random per visit, all levels)
+RETRY_MINUTES = 30           # retry an account this many minutes after an error
+
+
+def level_on(level):
+    """Is this account's level enabled for farming (config.LVL1/LVL2/LVL3)? Level 3+ uses LVL3."""
+    return bool({1: config.LVL1, 2: config.LVL2}.get(level, config.LVL3))
 
 # Private Key mission: current step -> the step to send to /missions/private-key/advance/
 MISSION_STEPS = {"none": "intro", "intro": "sequence", "sequence": "key", "key": "hacked", "hacked": "entropy"}
@@ -174,10 +198,9 @@ class Tick:
         self.claimed = Decimal(0)
         self.spent = Decimal(0)
         self.bought = {}
-        # claim a random 10-30 min before the cache is full (L1; same figure for this whole visit)
-        self.claim_margin_min = random.uniform(*config.GAME_CLAIM_MARGIN)
-        # L2: claim at a random 85-95% of capacity ("within 5-15% of full"), same figure for the visit
-        self.claim_pct = random.uniform(*config.GAME_CLAIM_PCT)
+        # claim at a random 75-100% of cache capacity (same figure this whole visit; RAM grows the cache
+        # time, so we go by fill fraction, not by minutes)
+        self.claim_pct = random.uniform(*CLAIM_PCT)
         self._extracted = False   # one discount extraction per visit (cooldown 120 s)
 
     # --- state helpers -------------------------------------------------------------------
@@ -200,7 +223,7 @@ class Tick:
 
     @property
     def available(self):
-        return self.balance - Decimal(config.GAME_QE_RESERVE)
+        return self.balance - Decimal(QE_RESERVE)
 
     def cache(self):
         c = self.st.get("cache") or {}
@@ -340,13 +363,13 @@ class Tick:
         The chip level does not carry into Level 2, so we attack as soon as it unlocks (chip 25) instead of
         maxing the chip first."""
         at = self.st.get("attack") or {}
-        return (config.GAME_ATTACK and self.level < 2
+        return (ATTACK and self.level < 2
                 and not (self.st.get("victory") or {}).get("completed_at")
                 and at.get("status") in ("locked", "ready", "cooldown"))
 
     def attack(self):
         at = self.st.get("attack") or {}
-        if not config.GAME_ATTACK or at.get("status") not in ("ready", "cooldown"):
+        if not ATTACK or at.get("status") not in ("ready", "cooldown"):
             return False
         # the entropy module carries into Level 2 (the chip does not): max it before winning, then attack
         ent = self.st.get("entropy") or {}
@@ -358,7 +381,7 @@ class Tick:
         e_now = _dec(ent.get("amount_exact_e"), Decimal(0))
         # stake for the best odds: p = 14% + 76%*(1 - e^(-E/200)) caps at 90% near 2000 E — more is wasted,
         # since staked E is consumed on a win too (and would otherwise fuel Level 2 blocks)
-        stake = min(_dec(config.GAME_ATTACK_ENTROPY, Decimal(2000)), e_now)
+        stake = min(_dec(ATTACK_ENTROPY, Decimal(2000)), e_now)
         if stake < 1:
             return False
         cost = _dec(at.get("cost_qe"), Decimal(0))
@@ -402,7 +425,7 @@ class Tick:
         return True
 
     def trials(self):
-        if not config.GAME_TRIALS:
+        if not TRIALS:
             return False
         did = False
         for trial in (self.bus_guardian, self.private_key, self.firewall, self.attack):
@@ -417,7 +440,7 @@ class Tick:
     def extract(self, item):
         """Burn E for a discount on the next purchase of `item` (ready extraction only). The discount is
         random and expires in ~30 min, so it is done right before buying. Refreshes to see the new price."""
-        if self.level < 2 or not config.GAME_EXTRACTION:
+        if self.level < 2 or not EXTRACTION:
             return False
         ex = self.st.get("extraction") or {}
         if ex.get("status") != "ready":
@@ -427,7 +450,7 @@ class Tick:
             return False   # part locked, or a discount for it is already waiting (reason "active")
         if any(a.get("item") == item for a in (ex.get("active") or [])):
             return False
-        tier = config.GAME_EXTRACTION_TIER
+        tier = EXTRACTION_TIER
         cost = next((_dec(t.get("cost_e")) for t in (ex.get("tiers") or []) if t.get("tier") == tier), None)
         e_now = _dec((self.st.get("entropy") or {}).get("amount_exact_e"), Decimal(0))
         if cost is None or e_now < cost:
@@ -468,7 +491,7 @@ class Tick:
         if limit <= 0:
             return True
         cur = float(_dec(h.get("heat"), Decimal(0)))
-        return cur + add <= limit * config.GAME_HEAT_SAFETY
+        return cur + add <= limit * HEAT_SAFETY
 
     PCIE_PARTS = ("super_chip", "capacitor", "power_line", "ram", "clock", "pcie_bus")
     PCIE_THRESHOLD = 5
@@ -498,7 +521,7 @@ class Tick:
         else:
             gain = 0.0
         # PCIE threshold look-ahead: bringing this part to level 5 adds +3%*pcie to every tick
-        if (config.GAME_PCIE_LOOKAHEAD and pcie > 0 and name in self.PCIE_PARTS
+        if (PCIE_LOOKAHEAD and pcie > 0 and name in self.PCIE_PARTS
                 and self._level_of(name) < self.PCIE_THRESHOLD):
             gain += sc_prod * 0.03 * pcie / (self.PCIE_THRESHOLD - self._level_of(name))
         return gain
@@ -559,7 +582,7 @@ class Tick:
             unlock = (self.st.get("attack") or {}).get("unlock_chip_level") or 25
             if self.chip_level() >= unlock:
                 opts.pop("chip", None)
-        if "chip" in opts and self.chip_level() < config.GAME_ENTROPY_AT_CHIP:
+        if "chip" in opts and self.chip_level() < ENTROPY_AT_CHIP:
             return ("chip", *opts["chip"])
         for name in ("entropy", "chip"):
             if name in opts:
@@ -581,7 +604,7 @@ class Tick:
             # L2: one discount extraction on the part we're about to buy (whatever it is), right before
             # buying — lowers its price. Only when it's actually affordable this visit, so the discount is
             # not wasted (it expires ~30 min). Tier from config (high = best odds of a big discount).
-            if self.level >= 2 and config.GAME_EXTRACTION and not self._extracted:
+            if self.level >= 2 and EXTRACTION and not self._extracted:
                 amount, _, _ = self.cache()
                 if self.available + amount.to_integral_value(rounding="ROUND_FLOOR") >= cost:
                     self._extracted = True
@@ -612,16 +635,15 @@ class Tick:
     # --- the visit -----------------------------------------------------------------------
 
     def claim_level(self):
-        """Cache amount from which it is claimed anyway. L2: a random 85-95% of capacity ("within 5-15% of
-        full"). L1: claim_margin_min minutes before it is full."""
-        _, capacity, prod = self.cache()
-        if self.level >= 2:
-            return capacity * Decimal(str(self.claim_pct))
-        return max(Decimal(0), capacity - prod * Decimal(self.claim_margin_min) * 60)
+        """Cache amount from which it is claimed: a random 75-100% of capacity (same figure this visit)."""
+        _, capacity, _ = self.cache()
+        return capacity * Decimal(str(self.claim_pct))
 
     def run(self):
-        # L2+ accounts just run the routine cycle: claim at the % threshold, then upgrades. Blocks/shields,
-        # sentinel waves and the Network Assault are NOT automated — they are played by hand in the browser.
+        if not level_on(self.level):
+            return SKIP_WAIT, "level off"   # this level is disabled in config -> leave the account alone
+        # Routine cycle: claim at the % threshold, then upgrades. Blocks/shields, sentinel waves and the
+        # Network Assault are NOT automated — they are played by hand in the browser.
         amount, capacity, _ = self.cache()
         if capacity > 0 and amount >= self.claim_level():
             self.claim()
@@ -629,7 +651,7 @@ class Tick:
         for _ in range(5):   # an upgrade may unlock a trial, a trial may unlock an upgrade
             did = self.trials() if self.level < 2 else False   # L1 trials only; L2 has no such trials
             before = sum(self.bought.values())
-            waiting_for = self.upgrades() if config.GAME_UPGRADE else None
+            waiting_for = self.upgrades() if UPGRADE else None
             if not did and sum(self.bought.values()) == before:
                 break
         if self.bought:
@@ -639,22 +661,18 @@ class Tick:
     def plan(self, waiting_for):
         """Seconds until the next visit + why."""
         amount, capacity, prod = self.cache()
-        waits = [(s + config.GAME_MARGIN_SEC, why) for s, why in self.waits]
+        waits = [(s + MARGIN_SEC, why) for s, why in self.waits]
         if prod > 0:
             claim_at = self.claim_level()
-            why_claim = (f"claim at {self.claim_pct * 100:.0f}% full" if self.level >= 2
-                         else f"claim {self.claim_margin_min:.0f}m before full")
             # the claim before the cache is full: no margin on top, better a bit early than full
-            waits.append((max(0.0, float((claim_at - amount) / prod)), why_claim))
+            waits.append((max(0.0, float((claim_at - amount) / prod)), f"claim at {self.claim_pct * 100:.0f}% full"))
             if waiting_for:
                 name, _, cost = waiting_for
                 need = cost - self.available - amount
                 if need <= claim_at - amount:   # reachable before the claim (min() below caps it at the claim)
-                    # L2: come back for the upgrade a random 1-15 min after enough QE (sooner than the claim,
-                    # so growth compounds faster); L1 keeps the fixed margin
-                    margin = (random.uniform(*config.GAME_L2_UPGRADE_JITTER) * 60
-                              if self.level >= 2 else config.GAME_MARGIN_SEC)
-                    waits.append((max(0.0, float(need / prod)) + margin, f"{name} {cost}QE"))
+                    # come back for the upgrade a random 1-10 min after enough QE piled up (before the claim)
+                    waits.append((max(0.0, float(need / prod)) + random.uniform(*UPGRADE_JITTER) * 60,
+                                  f"{name} {cost}QE"))
         sec, why = min(waits, key=lambda w: w[0]) if waits else (MAX_WAIT, "nothing to do")
         return min(MAX_WAIT, max(MIN_WAIT, sec)), why
 
@@ -682,21 +700,6 @@ class Tick:
                 f"qe {self.st.get('qe_balance')}")
 
 
-def skip_addresses(wallets):
-    """Addresses the bot never touches (config.GAME_SKIP): 1-based file positions and/or address strings.
-    Positions reveal nothing personal, so they are safe to keep in the committed config."""
-    out = set()
-    for it in config.GAME_SKIP:
-        if isinstance(it, bool):
-            continue
-        if isinstance(it, int):
-            if 1 <= it <= len(wallets):
-                out.add(wallets[it - 1]["address"].lower())
-        elif str(it).strip():
-            out.add(str(it).strip().lower())
-    return out
-
-
 def game_job(siwe):
     t = Tick(siwe.session)
     wait_sec, why = t.run()
@@ -707,8 +710,8 @@ def game_job(siwe):
         parts.append("⬆ " + ", ".join(f"{n}+{k}" for n, k in t.bought.items()) + f" (-{t.spent}QE)")
     parts += t.log
     parts.append(t.summary())
-    return {"wait": wait_sec, "why": why, "text": " | ".join(parts),
-            "info": t.summary(), "claimed": t.claimed, "spent": t.spent}
+    return {"wait": wait_sec, "why": why, "text": " | ".join(parts), "info": t.summary(),
+            "claimed": t.claimed, "spent": t.spent, "level": t.level}
 
 
 # --- accounts and schedule -----------------------------------------------------------------
@@ -736,27 +739,23 @@ class StoreFile:
 
 
 def open_wallets():
-    """config.GAME_SOURCE -> (wallet file, [wallet dicts], description)."""
-    if config.GAME_SOURCE == 3:
+    """SOURCE -> (wallet file, [wallet dicts], description)."""
+    if SOURCE == 3:
         wf = WalletFile(WALLET_FILE)
         todo, done = wf.split()
         return wf, done, f"{WALLET_FILE}: {len(done)} done ({len(todo)} not registered skipped)"
-    if config.GAME_SOURCE == 1:
+    if SOURCE == 1:
         sf, name = StoreFile(AccountStore(ACCOUNTS_FILE)), ACCOUNTS_FILE
-    elif config.GAME_SOURCE == 2:
+    elif SOURCE == 2:
         sf, name = StoreFile(BoostStore(config.BOOST_FILE)), config.BOOST_FILE
     else:
-        raise SystemExit(f"[!] config.GAME_SOURCE must be 1, 2 or 3, got {config.GAME_SOURCE!r}")
+        raise SystemExit(f"[!] SOURCE must be 1, 2 or 3, got {SOURCE!r}")
     wallets = sf.wallets()
-    skip = skip_addresses(wallets)
-    if skip:
-        kept = [w for w in wallets if w["address"].lower() not in skip]
-        return sf, kept, f"{name}: {len(kept)} accounts ({len(wallets) - len(kept)} skipped — played by hand)"
     return sf, wallets, f"{name}: {len(wallets)} accounts"
 
 
 class Schedule:
-    """GAME_SCHEDULE_FILE: {address: {"next_at": unix time, "why": ..., "info": ...}}, rewritten atomically."""
+    """SCHEDULE_FILE: {address: {"next_at": unix time, "why": ..., "info": ..., "level": ...}}, atomic."""
 
     def __init__(self, path):
         self.path = path
@@ -772,6 +771,9 @@ class Schedule:
     def due_at(self, addr):
         return (self.data.get(addr.lower()) or {}).get("next_at", 0)
 
+    def level(self, addr):
+        return (self.data.get(addr.lower()) or {}).get("level")
+
     def set(self, addr, next_at, **info):
         with self.lock:
             self.data[addr.lower()] = {"next_at": next_at,
@@ -783,18 +785,18 @@ class Schedule:
 def main():
     wallet_file, wallets, desc = open_wallets()
     pool = ProxyPool(config.PROXY_FILE)
-    sched = Schedule(config.GAME_SCHEDULE_FILE)
+    sched = Schedule(SCHEDULE_FILE)
     by_addr = {w["address"]: w for w in wallets}
     now = time.time()
-    print(f"[*] Game - {desc} | {config.GAME_THREADS} threads | {pool.remaining()} spare proxies")
+    print(f"[*] Game - {desc} | {config.THREADS} threads | {pool.remaining()} spare proxies")
     print(f"[*] {sum(1 for a in by_addr if sched.due_at(a) <= now)} due now, schedule in "
-          f"{config.GAME_SCHEDULE_FILE} | Ctrl+C to stop\n")
+          f"{SCHEDULE_FILE} | Ctrl+C to stop\n")
 
     stats = {"ticks": 0, "fail": 0, "claimed": Decimal(0), "spent": Decimal(0)}
     running = {}   # future -> address
     idle_note = 0
     net_trouble = False   # set when a worker reports the machine is offline (net_down)
-    ex = ThreadPoolExecutor(max_workers=config.GAME_THREADS)
+    ex = ThreadPoolExecutor(max_workers=config.THREADS)
     try:
         while True:
             now = time.time()
@@ -806,11 +808,16 @@ def main():
                 elif not running:
                     time.sleep(config.GAME_NET_WAIT_SEC)   # offline: re-check every GAME_NET_WAIT_SEC
                     continue
-            free = config.GAME_THREADS - len(running)
             busy = set(running.values())
             due = sorted((sched.due_at(a), a) for a in by_addr if a not in busy and sched.due_at(a) <= now)
             if not net_trouble:   # offline: let the in-flight ones finish, start nothing new
-                for _, addr in due[:free]:
+                for _, addr in due:
+                    if len(running) >= config.THREADS:
+                        break
+                    lvl = sched.level(addr)
+                    if lvl is not None and not level_on(lvl):   # this level disabled -> park, don't touch it
+                        sched.set(addr, now + SKIP_WAIT, why="level off", level=lvl)
+                        continue
                     running[ex.submit(with_session, game_job, by_addr[addr], pool, wallet_file)] = addr
 
             if not running:
@@ -831,7 +838,7 @@ def main():
                     stats["claimed"] += res["claimed"]
                     stats["spent"] += res["spent"]
                     text = f"{res['via']} | {res['text']}"
-                    sched.set(addr, time.time() + sec, why=why, info=res["info"])
+                    sched.set(addr, time.time() + sec, why=why, info=res["info"], level=res.get("level"))
                 elif res.get("net_down"):   # the machine is offline — not a real per-account error
                     if not net_trouble:
                         print(f"[{time.strftime('%H:%M:%S')}] [!] интернета нет — пауза, прокси не трогаем")
@@ -841,7 +848,7 @@ def main():
                     sched.set(addr, time.time() + sec, why=why)
                 else:
                     stats["fail"] += 1
-                    sec, why = config.GAME_RETRY_MINUTES * 60, "retry after error"
+                    sec, why = RETRY_MINUTES * 60, "retry after error"
                     text = f"FAIL {res.get('error')}"
                     sched.set(addr, time.time() + sec, why=why, error=str(res.get("error"))[:300])
                 print(f"[{time.strftime('%H:%M:%S')}] {addr} | {text} | next in {_fmt_wait(sec)} ({why})")
