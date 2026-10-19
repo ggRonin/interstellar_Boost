@@ -28,7 +28,7 @@ a dead proxy is replaced by the next one from Proxy.txt and written into the wal
 The first game request asks for a human check: POST /game/session/ with a Cap.js captcha -> a game
 session cookie for 12 h, saved with the account session.
 
-Not automated: forks, extractions, blocks, network assault, thrones (on-chain DACC payment).
+Not automated: forks, sentinel waves, network assault, thrones (on-chain DACC payment).
 """
 
 import json
@@ -417,7 +417,7 @@ class Tick:
 
     def validate_block(self):
         """Validate one block (POW solved server-side): a shield against attacks + QE into the cache.
-        Costs the block's E. Callers gate it (claim time, or sentinel-wave defence)."""
+        Costs the block's E. Callers gate it (claim time, or block farming)."""
         if self.level < 2:
             return False
         b = self.st.get("blocks") or {}
@@ -460,94 +460,6 @@ class Tick:
         if self.validate_block():   # +fixed bonus into the (now emptier) cache, shields ~30 min
             self.claim()            # take the bonus (plus whatever production piled up)
         return random.uniform(*config.GAME_BLOCK_REVISIT_MIN) * 60
-
-    def defend_sentinel(self):
-        """Beat an active sentinel wave (super chip 20/30). A sentinel strikes ONLY while your shield is
-        down ("strikes once your shield has expired") — a standing shield blocks the strike from ever
-        coming, so the wave stalls. The right play: leave the shield down, wait for the strike to be
-        announced (incoming), then raise a block shield within the landing window so it is repelled
-        (held +1) and immediately used up. Returns a short revisit interval to catch the next window."""
-        if self.level < 2 or not config.GAME_SENTINEL_DEFEND:
-            return None
-        se = self.st.get("sentinels") or {}
-        if se.get("status") != "active" or se.get("all_beaten"):
-            return None
-        na = self.st.get("network_attacks") or {}
-        if na.get("warning"):   # a strike is incoming -> raise a shield now to repel it (do NOT pre-shield)
-            if self.validate_block():
-                self.log.append("🛡 sentinel repel")
-            return 15.0
-        # no strike incoming: keep the shield DOWN so the sentinel will strike; check back often (the
-        # landing window is short, ~1 min) to catch the next announcement
-        return 40.0
-
-    def assault(self):
-        """Network Assault — the Level 2 boss, after all three sentinel waves are beaten. Build a streak by
-        validating N blocks in a row (each block also shields, so a landed attack can't break the streak),
-        then the final strike commits E on a verifiable draw (~90% at the capped stake). A win completes
-        Level 2 and unlocks the Level 3 throne; a break -> cooldown, retry. Returns a revisit interval or None."""
-        if self.level < 2 or not config.GAME_ASSAULT:
-            return None
-        na = self.st.get("network_assault") or {}
-        status = na.get("status")
-        if status in (None, "locked", "won"):
-            return None
-        if status == "cooldown":   # broke/lost: wait out the cooldown, then retry
-            self.waits.append((_left(na.get("cooldown_until")) or 600, "assault cooldown"))
-            return None
-        if status == "ready":
-            ok, d = self.game.action("/game/assault/start/")
-            if not ok:
-                self.log.append(f"assault start: {d}")
-                return None
-            self.log.append("⚔ assault started")
-            self.refresh()
-            status = (self.st.get("network_assault") or {}).get("status")
-        if status != "active":
-            return None
-        need = (self.st.get("network_assault") or {}).get("streak_required") or 5
-        # build the streak: validate blocks (each one shields, so attacks don't break the streak). Try a few
-        # in this visit; if the server paces them (streak stops growing) come back shortly for the next.
-        for _ in range(need + 2):
-            na = self.st.get("network_assault") or {}
-            if na.get("streak_complete") or (na.get("streak") or 0) >= need:
-                break
-            before = na.get("streak") or 0
-            if not self.validate_block():
-                break
-            self.refresh()
-            if ((self.st.get("network_assault") or {}).get("streak") or 0) <= before:
-                return 90.0   # paced: streak did not grow this visit, revisit soon for the next block
-        na = self.st.get("network_assault") or {}
-        if not (na.get("streak_complete") or (na.get("streak") or 0) >= need):
-            return 90.0
-        # streak complete -> final strike with E (verifiable draw). The game caps the stake near ~90%;
-        # a bigger one is INVALID_ENTROPY, so step down until accepted.
-        e_now = _dec((self.st.get("entropy") or {}).get("amount_exact_e"), Decimal(0))
-        stake = min(_dec(config.GAME_ASSAULT_ENTROPY, Decimal(7245)), e_now)
-        if stake < 1:
-            return 120.0
-        ok, d = False, None
-        for _ in range(5):
-            try:
-                aid = self.game.draw("network_assault")
-            except GameError as e:
-                d = str(e)
-                break
-            ok, d = self.game.action("/game/assault/strike/", action_id=aid,
-                                     client_seed=secrets.token_hex(32), entropy=int(stake))
-            if ok or d != "INVALID_ENTROPY" or stake <= 100:
-                break
-            stake = (stake * Decimal(7) / Decimal(10)).to_integral_value(rounding="ROUND_FLOOR")
-        if ok:
-            self.merge(d)
-            self.refresh()
-            self.log.append(f"⚔ assault strike: {(self.st.get('network_assault') or {}).get('status')}")
-        else:
-            self.log.append(f"assault strike: {d}")
-            if "ENTROPY_SOURCE_UNAVAILABLE" in str(d):
-                self.waits.append((random.uniform(120, 300), "assault retry"))
-        return 120.0
 
     def extract(self, item):
         """Burn E for a discount on the next purchase of `item` (ready extraction only). The discount is
@@ -755,14 +667,9 @@ class Tick:
         return max(Decimal(0), capacity - prod * Decimal(self.claim_margin_min) * 60)
 
     def run(self):
-        # L2: defend sentinel waves; once they are all beaten, run the Network Assault boss
-        extra_iv = farmed = None
-        if self.level >= 2:
-            extra_iv = self.defend_sentinel()
-            if extra_iv is None:
-                extra_iv = self.assault()
-            if extra_iv is None:
-                extra_iv = farmed = self.block_farm()   # farms + claims at the % threshold on its own
+        # L2+ accounts just run the routine cycle (claim, upgrades, optional block farming). Sentinel waves
+        # and the Network Assault are NOT automated — they are played by hand in the browser.
+        farmed = self.block_farm() if self.level >= 2 else None   # farms + claims at the % threshold on its own
         if farmed is None:   # block_farm did not run: do the normal claim-at-threshold
             amount, capacity, _ = self.cache()
             if capacity > 0 and amount >= self.claim_level():
@@ -778,14 +685,12 @@ class Tick:
                 break
         if self.bought:
             self.refresh()
-        return self.plan(waiting_for, extra_iv, farm_iv=farmed)
+        return self.plan(waiting_for, farm_iv=farmed)
 
-    def plan(self, waiting_for, extra_iv=None, farm_iv=None):
+    def plan(self, waiting_for, farm_iv=None):
         """Seconds until the next visit + why."""
         amount, capacity, prod = self.cache()
         waits = [(s + config.GAME_MARGIN_SEC, why) for s, why in self.waits]
-        if extra_iv and farm_iv is None:   # a sentinel wave / assault is in progress: come back soon
-            waits.append((random.uniform(0.3, 0.5) * extra_iv, "sentinel/assault"))
         if farm_iv:   # block farming: revisit on the full (jittered) interval, not sooner
             waits.append((farm_iv, "block farm"))
         if prod > 0:
