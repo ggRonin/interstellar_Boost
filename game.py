@@ -585,6 +585,26 @@ class Tick:
             return (self.st.get("super_chip") or {}).get("level") or 0
         return ((self.st.get("components") or {}).get(name) or {}).get("level") or 0
 
+    def _heat_per_level(self, name):
+        """Heat a single level of `name` adds. Only the super chip, clock and validator run hot."""
+        if name == "super_chip":
+            return float(_dec((self.st.get("super_chip") or {}).get("heat_per_level"), Decimal(0)))
+        eff = (((self.st.get("components") or {}).get(name) or {}).get("effect")) or {}
+        return float(_dec(eff.get("heat_per_level"), Decimal(0)))
+
+    def _heat_ok(self, name):
+        """True if buying one level of `name` keeps heat under the limit. Above the limit production is
+        halved, so a hot part is held back until the limit is raised (heatsink). Cool parts always pass."""
+        add = self._heat_per_level(name)
+        if add <= 0:
+            return True
+        h = self.st.get("heat") or {}
+        limit = float(_dec(h.get("limit"), Decimal(0)))
+        if limit <= 0:
+            return True
+        cur = float(_dec(h.get("heat"), Decimal(0)))
+        return cur + add <= limit * config.GAME_HEAT_SAFETY
+
     PCIE_PARTS = ("super_chip", "capacitor", "power_line", "ram", "clock", "pcie_bus")
     PCIE_THRESHOLD = 5
 
@@ -622,14 +642,20 @@ class Tick:
         """Level 2: the upgrade with the best QE/s gained per QE spent. Super chip wins early (it is the
         base everything else multiplies); a component takes over once its %-bonus beats a chip level."""
         opts = {n: o for n, o in self.options().items() if n not in blocked}
-        ranked = []
+        ranked, heat_blocked = [], False
         for name, (path, cost) in opts.items():
             gain = self._marginal_gain(name)
             if gain > 0 and cost > 0:
+                if not self._heat_ok(name):
+                    heat_blocked = True   # profitable but would overheat -> raise the limit first
+                    continue
                 ranked.append((gain / float(cost), name, path, cost))
         if ranked:
             _, name, path, cost = max(ranked)
             return (name, path, cost)
+        # everything profitable is held back by heat: buy a heatsink to lift the limit, if it is offered
+        if heat_blocked and "heatsink" in opts:
+            return ("heatsink", *opts["heatsink"])
         return ("super_chip", *opts["super_chip"]) if "super_chip" in opts else None
 
     # --- upgrades ------------------------------------------------------------------------
@@ -639,8 +665,11 @@ class Tick:
         st, out = self.st, {}
 
         def add(name, path, item, level_key="level"):
+            # next_cost_qe is the server's "buyable" signal (null = maxed/closed). On Level 3 the season
+            # reopens components past their old max_level (level >= max_level) but keeps them buyable, so the
+            # max_level guard would wrongly drop them — rely on next_cost_qe alone.
             cost = _dec(item.get("next_cost_qe"))
-            if cost is not None and (item.get(level_key) or 0) < (item.get("max_level") or 0):
+            if cost is not None:
                 out[name] = (path, cost)
 
         # a won attack retires the Level 1 chip and module (LEVEL_1_CLOSED): nothing to buy until the throne
@@ -782,6 +811,12 @@ class Tick:
         if self.level >= 2:
             sc = self.st.get("super_chip") or {}
             ent = self.st.get("entropy") or {}
+            if self.level >= 3:   # L3: super chip is maxed; heat and layers are what matters now
+                h = self.st.get("heat") or {}
+                lay = (self.st.get("chip_layers") or {}).get("layers")
+                hot = " 🔥throttled" if h.get("throttled") else ""
+                return (f"L3 ({prod.normalize()} QE/s) | heat {h.get('heat')}/{h.get('limit')}{hot} | "
+                        f"layers {lay} | E {ent.get('amount_e')} | qe {self.st.get('qe_balance')}")
             return (f"L2 super {sc.get('level')}/{sc.get('max_level')} ({prod.normalize()} QE/s) | "
                     f"E {ent.get('amount_e')} | qe {self.st.get('qe_balance')}")
         vic = self.st.get("victory") or {}
