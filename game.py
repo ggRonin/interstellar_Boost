@@ -771,6 +771,18 @@ class Schedule:
     def due_at(self, addr):
         return (self.data.get(addr.lower()) or {}).get("next_at", 0)
 
+    def level(self, addr):
+        return (self.data.get(addr.lower()) or {}).get("level")
+
+    def recheck_levels(self):
+        """On startup: forget cached levels so each account's level is re-read on its next visit, and bring
+        the skipped ("level off") ones forward so they re-check right away. A restart = re-read all levels."""
+        with self.lock:
+            for e in self.data.values():
+                if e.pop("level", None) is not None and e.get("why") == "level off":
+                    e["next_at"] = 0   # was skipped -> make it due now so the level is re-read
+            write_lines(self.path, [json.dumps(self.data, ensure_ascii=False, indent=1)])
+
     def set(self, addr, next_at, **info):
         with self.lock:
             self.data[addr.lower()] = {"next_at": next_at,
@@ -783,6 +795,7 @@ def main():
     wallet_file, wallets, desc = open_wallets()
     pool = ProxyPool(config.PROXY_FILE)
     sched = Schedule(SCHEDULE_FILE)
+    sched.recheck_levels()   # restart re-reads every account's level (no 6h polling during the run)
     by_addr = {w["address"]: w for w in wallets}
     now = time.time()
     print(f"[*] Game - {desc} | {config.THREADS} threads | {pool.remaining()} spare proxies")
@@ -805,11 +818,16 @@ def main():
                 elif not running:
                     time.sleep(config.GAME_NET_WAIT_SEC)   # offline: re-check every GAME_NET_WAIT_SEC
                     continue
-            free = config.THREADS - len(running)
             busy = set(running.values())
             due = sorted((sched.due_at(a), a) for a in by_addr if a not in busy and sched.due_at(a) <= now)
             if not net_trouble:   # offline: let the in-flight ones finish, start nothing new
-                for _, addr in due[:free]:
+                for _, addr in due:
+                    if len(running) >= config.THREADS:
+                        break
+                    lvl = sched.level(addr)
+                    if lvl is not None and not level_on(lvl):   # level known & disabled -> re-park locally,
+                        sched.set(addr, now + SKIP_WAIT, why="level off", level=lvl)   # never touched again
+                        continue                                                       # (until restart)
                     running[ex.submit(with_session, game_job, by_addr[addr], pool, wallet_file)] = addr
 
             if not running:
