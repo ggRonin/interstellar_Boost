@@ -738,6 +738,21 @@ class Tick:
 _FARM_ADDRS = set()   # lowercased addresses with aggressive block farming on (filled by main via config)
 
 
+def skip_addresses(wallets):
+    """Addresses the bot never touches (config.GAME_SKIP): 1-based file positions and/or address strings.
+    Positions reveal nothing personal, so they are safe to keep in the committed config."""
+    out = set()
+    for it in config.GAME_SKIP:
+        if isinstance(it, bool):
+            continue
+        if isinstance(it, int):
+            if 1 <= it <= len(wallets):
+                out.add(wallets[it - 1]["address"].lower())
+        elif str(it).strip():
+            out.add(str(it).strip().lower())
+    return out
+
+
 def farm_addresses(wallets):
     """Addresses for which aggressive block farming is on. config.GAME_BLOCK_FARM is 0 (off), 1 (all L2),
     or a list of 1-based positions in the account list — so a specific account is picked without any
@@ -805,7 +820,9 @@ def open_wallets():
     else:
         raise SystemExit(f"[!] config.GAME_SOURCE must be 1, 2 or 3, got {config.GAME_SOURCE!r}")
     wallets = sf.wallets()
-    skip = {a.strip().lower() for a in config.GAME_SKIP if a.strip()}
+    global _FARM_ADDRS
+    _FARM_ADDRS = farm_addresses(wallets)   # resolve farm positions against full file order (before skip)
+    skip = skip_addresses(wallets)
     if skip:
         kept = [w for w in wallets if w["address"].lower() not in skip]
         return sf, kept, f"{name}: {len(kept)} accounts ({len(wallets) - len(kept)} skipped — played by hand)"
@@ -842,8 +859,6 @@ def main():
     pool = ProxyPool(config.PROXY_FILE)
     sched = Schedule(config.GAME_SCHEDULE_FILE)
     by_addr = {w["address"]: w for w in wallets}
-    global _FARM_ADDRS
-    _FARM_ADDRS = farm_addresses(wallets)
     now = time.time()
     farm_note = f" | block farm: {len(_FARM_ADDRS)} acct(s)" if _FARM_ADDRS else ""
     print(f"[*] Game - {desc} | {config.GAME_THREADS} threads | {pool.remaining()} spare proxies{farm_note}")
