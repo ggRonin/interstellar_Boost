@@ -28,7 +28,7 @@ a dead proxy is replaced by the next one from Proxy.txt and written into the wal
 The first game request asks for a human check: POST /game/session/ with a Cap.js captcha -> a game
 session cookie for 12 h, saved with the account session.
 
-Not automated: forks, sentinel waves, network assault, thrones (on-chain DACC payment).
+Not automated: forks, blocks/shields, sentinel waves, network assault, thrones (on-chain DACC payment).
 """
 
 import json
@@ -166,7 +166,7 @@ class Game:
 class Tick:
     """One visit of an account: claim / trials / upgrades, then when to come back."""
 
-    def __init__(self, session, block_farm=False):
+    def __init__(self, session):
         self.game = Game(session)
         self.st = self.game.state()
         self.log = []
@@ -174,7 +174,6 @@ class Tick:
         self.claimed = Decimal(0)
         self.spent = Decimal(0)
         self.bought = {}
-        self._farm_enabled = block_farm   # aggressive block farming on for this account (per GAME_BLOCK_FARM)
         # claim a random 10-30 min before the cache is full (L1; same figure for this whole visit)
         self.claim_margin_min = random.uniform(*config.GAME_CLAIM_MARGIN)
         # L2: claim at a random 85-95% of capacity ("within 5-15% of full"), same figure for the visit
@@ -413,53 +412,7 @@ class Tick:
                 self.log.append(str(e))
         return did
 
-    # --- level 2: blocks, extraction, super chip -----------------------------------------
-
-    def validate_block(self):
-        """Validate one block (POW solved server-side): a shield against attacks + QE into the cache.
-        Costs the block's E. Callers gate it (claim time, or block farming)."""
-        if self.level < 2:
-            return False
-        b = self.st.get("blocks") or {}
-        cost_e = _dec(b.get("cost_e"), Decimal(0))
-        e_now = _dec((self.st.get("entropy") or {}).get("amount_exact_e"), Decimal(0))
-        if e_now < cost_e:
-            return False
-        try:
-            aid = self.game.draw("block_validation")
-        except GameError as e:
-            self.log.append(f"block draw: {e}")
-            return False
-        ok, d = self.game.action("/game/blocks/validate/", action_id=aid, client_seed=secrets.token_hex(32))
-        if not ok:
-            self.log.append(f"block: {d}")
-            return False
-        self.merge(d)
-        recent = ((d.get("blocks") or {}).get("recent") or [None]) if isinstance(d, dict) else [None]
-        if recent and recent[0]:
-            self.log.append(f"⛏ block +{recent[0].get('reward_qe')}QE")
-        return True
-
-    def block_farm(self):
-        """L2 leaderboard climb. A validated block drops a FIXED bonus into the cache (~2M QE for ~24 E),
-        independent of production; claiming empties the cache so the next block's bonus lands in full. ONE
-        validate+claim per visit — never a tight loop (a per-second cadence is an obvious bot, like the WS
-        403). Revisit on a randomised human interval; if production fills the cache sooner, plan() brings the
-        visit forward on the claim instead. Returns the revisit interval in seconds (None -> normal cycle)."""
-        if self.level < 2 or not self._farm_enabled:
-            return None
-        b = self.st.get("blocks") or {}
-        cost_e = _dec(b.get("cost_e"), Decimal(0))
-        e_now = _dec((self.st.get("entropy") or {}).get("amount_exact_e"), Decimal(0))
-        if e_now < cost_e:   # no E for a block: fall back to the normal claim cycle
-            return None
-        amount, capacity, _ = self.cache()
-        # claim first if the cache is already near full, so the block's bonus does not overflow and waste
-        if capacity > 0 and amount >= self.claim_level():
-            self.claim()
-        if self.validate_block():   # +fixed bonus into the (now emptier) cache, shields ~30 min
-            self.claim()            # take the bonus (plus whatever production piled up)
-        return random.uniform(*config.GAME_BLOCK_REVISIT_MIN) * 60
+    # --- level 2: extraction, super chip -------------------------------------------------
 
     def extract(self, item):
         """Burn E for a discount on the next purchase of `item` (ready extraction only). The discount is
@@ -667,15 +620,11 @@ class Tick:
         return max(Decimal(0), capacity - prod * Decimal(self.claim_margin_min) * 60)
 
     def run(self):
-        # L2+ accounts just run the routine cycle (claim, upgrades, optional block farming). Sentinel waves
-        # and the Network Assault are NOT automated — they are played by hand in the browser.
-        farmed = self.block_farm() if self.level >= 2 else None   # farms + claims at the % threshold on its own
-        if farmed is None:   # block_farm did not run: do the normal claim-at-threshold
-            amount, capacity, _ = self.cache()
-            if capacity > 0 and amount >= self.claim_level():
-                if config.GAME_VALIDATE_BLOCK:
-                    self.validate_block()   # L2: shield + reward into the cache, then claim takes it all
-                self.claim()
+        # L2+ accounts just run the routine cycle: claim at the % threshold, then upgrades. Blocks/shields,
+        # sentinel waves and the Network Assault are NOT automated — they are played by hand in the browser.
+        amount, capacity, _ = self.cache()
+        if capacity > 0 and amount >= self.claim_level():
+            self.claim()
         waiting_for = None
         for _ in range(5):   # an upgrade may unlock a trial, a trial may unlock an upgrade
             did = self.trials() if self.level < 2 else False   # L1 trials only; L2 has no such trials
@@ -685,14 +634,12 @@ class Tick:
                 break
         if self.bought:
             self.refresh()
-        return self.plan(waiting_for, farm_iv=farmed)
+        return self.plan(waiting_for)
 
-    def plan(self, waiting_for, farm_iv=None):
+    def plan(self, waiting_for):
         """Seconds until the next visit + why."""
         amount, capacity, prod = self.cache()
         waits = [(s + config.GAME_MARGIN_SEC, why) for s, why in self.waits]
-        if farm_iv:   # block farming: revisit on the full (jittered) interval, not sooner
-            waits.append((farm_iv, "block farm"))
         if prod > 0:
             claim_at = self.claim_level()
             why_claim = (f"claim at {self.claim_pct * 100:.0f}% full" if self.level >= 2
@@ -735,9 +682,6 @@ class Tick:
                 f"qe {self.st.get('qe_balance')}")
 
 
-_FARM_ADDRS = set()   # lowercased addresses with aggressive block farming on (filled by main via config)
-
-
 def skip_addresses(wallets):
     """Addresses the bot never touches (config.GAME_SKIP): 1-based file positions and/or address strings.
     Positions reveal nothing personal, so they are safe to keep in the committed config."""
@@ -753,24 +697,8 @@ def skip_addresses(wallets):
     return out
 
 
-def farm_addresses(wallets):
-    """Addresses for which aggressive block farming is on. config.GAME_BLOCK_FARM is 0 (off), 1 (all L2),
-    or a list of 1-based positions in the account list — so a specific account is picked without any
-    address going into the committed config."""
-    bf = config.GAME_BLOCK_FARM
-    if not bf:
-        return set()
-    if bf is True or bf == 1:
-        return {w["address"].lower() for w in wallets}
-    picked = set()
-    for pos in bf:   # 1-based positions, in file order
-        if isinstance(pos, int) and 1 <= pos <= len(wallets):
-            picked.add(wallets[pos - 1]["address"].lower())
-    return picked
-
-
 def game_job(siwe):
-    t = Tick(siwe.session, block_farm=siwe.address.lower() in _FARM_ADDRS)
+    t = Tick(siwe.session)
     wait_sec, why = t.run()
     parts = []
     if t.claimed:
@@ -820,8 +748,6 @@ def open_wallets():
     else:
         raise SystemExit(f"[!] config.GAME_SOURCE must be 1, 2 or 3, got {config.GAME_SOURCE!r}")
     wallets = sf.wallets()
-    global _FARM_ADDRS
-    _FARM_ADDRS = farm_addresses(wallets)   # resolve farm positions against full file order (before skip)
     skip = skip_addresses(wallets)
     if skip:
         kept = [w for w in wallets if w["address"].lower() not in skip]
@@ -860,8 +786,7 @@ def main():
     sched = Schedule(config.GAME_SCHEDULE_FILE)
     by_addr = {w["address"]: w for w in wallets}
     now = time.time()
-    farm_note = f" | block farm: {len(_FARM_ADDRS)} acct(s)" if _FARM_ADDRS else ""
-    print(f"[*] Game - {desc} | {config.GAME_THREADS} threads | {pool.remaining()} spare proxies{farm_note}")
+    print(f"[*] Game - {desc} | {config.GAME_THREADS} threads | {pool.remaining()} spare proxies")
     print(f"[*] {sum(1 for a in by_addr if sched.due_at(a) <= now)} due now, schedule in "
           f"{config.GAME_SCHEDULE_FILE} | Ctrl+C to stop\n")
 
