@@ -74,7 +74,6 @@ EXTRACTION = True            # L2: burn E for a discount on the part about to be
 EXTRACTION_TIER = "high"     # base / medium / high (best odds of a big discount)
 PCIE_LOOKAHEAD = True        # L2: climb cheap parts to 5 for the PCIE multiplier
 HEAT_SAFETY = 0.95           # L3: don't push heat past this fraction of the limit
-QUANTUM_PAYBACK_HOURS = 24    # L3: buy a quantum-chip level when its cost pays back (via its discount) within this
 MARGIN_SEC = 120             # slack added to a computed revisit time
 UPGRADE_JITTER = (1, 10)     # min: when enough QE for an upgrade, revisit a random 1-10 min later
 CLAIM_PCT = (0.75, 1.0)      # claim when the cache is this fraction full (random per visit, all levels)
@@ -511,8 +510,11 @@ class Tick:
         per = float(_dec((self.st.get("super_chip") or {}).get("prod_per_level_qe"), Decimal(50)))
         sc, pl = self._level_of("super_chip"), self._level_of("power_line")
         cap, clk, pcie = self._level_of("capacitor"), self._level_of("clock"), self._level_of("pcie_bus")
-        # pcie: +3% per level for each part already at level >= 5
-        parts5 = sum(1 for n in self.PCIE_PARTS if self._level_of(n) >= self.PCIE_THRESHOLD)
+        # pcie: +3% per level for EACH part at level >= 5 — every unlocked component plus the super chip,
+        # as the game counts them (not only the PCIE_PARTS used for the look-ahead below)
+        parts5 = (1 if sc >= self.PCIE_THRESHOLD else 0) + sum(
+            1 for c in (self.st.get("components") or {}).values()
+            if c.get("unlocked") and (c.get("level") or 0) >= self.PCIE_THRESHOLD)
         sc_base = sc * per
         sc_prod = sc_base * (1 + 0.08 * pl)
         pct = 0.05 * cap + 0.05 * clk + 0.03 * pcie * parts5
@@ -524,6 +526,12 @@ class Tick:
             gain = sc_prod * 0.05
         elif name == "pcie_bus":
             gain = sc_prod * 0.03 * parts5
+        elif name == "quantum_chip":
+            # no production of its own, but its discount saves on every future purchase: effective QE/s =
+            # discount per level × the rate QE is spent (≈ production). Lets ROI weigh it vs real production.
+            eff = ((self.st.get("components") or {}).get("quantum_chip") or {}).get("effect") or {}
+            _, _, prod = self.cache()
+            gain = float(_dec(eff.get("discount_per_level"), Decimal("0.03"))) * float(prod)
         else:
             gain = 0.0
         # PCIE threshold look-ahead: bringing this part to level 5 adds +3%*pcie to every tick
@@ -576,43 +584,32 @@ class Tick:
                 add(name, f"/game/components/{name}/purchase/", c)
         return out
 
-    def _quantum_target(self, opts):
-        """Level 3: the quantum chip discounts every OTHER part by 3%/level (up to 30%) while coherence is
-        high; the cryostat keeps coherence high (recovery vs a steady decay). Buy the cryostat first so
-        recovery beats decay (else the discount lapses between visits), then buy a quantum-chip level while
-        its cost pays back through the discount within QUANTUM_PAYBACK_HOURS of spending. Returns a target."""
-        if self.level < 3:
+    def _cryostat_maintenance(self, opts):
+        """Level 3: the quantum chip's discount only applies while coherence is high, and coherence decays.
+        Once the quantum chip has levels, buy the cryostat until its recovery beats the decay so the discount
+        does not lapse. The quantum chip itself competes by ROI in _marginal_gain, not here. Returns a target
+        or None (a prerequisite, so it is checked before the ROI pick)."""
+        if self.level < 3 or "cryostat" not in opts:
             return None
-        q = self.st.get("quantum") or {}
         qc = ((self.st.get("components") or {}).get("quantum_chip")) or {}
-        cryo = ((self.st.get("components") or {}).get("cryostat")) or {}
-        _, _, prod = self.cache()
-        p = float(prod)
-        if p <= 0:
+        if (qc.get("level") or 0) <= 0:   # nothing to protect until the quantum chip is on
             return None
-        decay = float(_dec(q.get("decay_per_min"), Decimal(2)))
-        # 1) once the quantum chip is on, keep coherence net-positive with the cryostat
-        if (qc.get("level") or 0) > 0 and "cryostat" in opts:
-            per_lvl = float(_dec((cryo.get("effect") or {}).get("recovery_per_level_per_min"), Decimal("0.5")))
-            if per_lvl * (cryo.get("level") or 0) <= decay:
-                return ("cryostat", *opts["cryostat"])
-        # 2) buy a quantum-chip level while it pays back fast enough through the discount on future buys
-        if "quantum_chip" in opts:
-            cost = float(opts["quantum_chip"][1])
-            per = float(_dec((qc.get("effect") or {}).get("discount_per_level"), Decimal("0.03")))
-            if per > 0 and cost / (per * p) <= QUANTUM_PAYBACK_HOURS * 3600:
-                return ("quantum_chip", *opts["quantum_chip"])
+        decay = float(_dec((self.st.get("quantum") or {}).get("decay_per_min"), Decimal(2)))
+        cryo = ((self.st.get("components") or {}).get("cryostat")) or {}
+        per_lvl = float(_dec((cryo.get("effect") or {}).get("recovery_per_level_per_min"), Decimal("0.5")))
+        if per_lvl * (cryo.get("level") or 0) <= decay:   # recovery not yet beating decay -> coherence slips
+            return ("cryostat", *opts["cryostat"])
         return None
 
     def target(self, blocked):
         """The next upgrade to buy. Returns (name, path, cost) or None.
-        Level 3: quantum chip/cryostat when they pay back, else best production ROI. Level 2: best ROI.
-        Level 1: chip up to ENTROPY_AT_CHIP, entropy, chip, cheapest."""
+        Level 3: keep coherence (cryostat) if the quantum chip needs it, else best ROI (quantum chip included
+        by its discount value). Level 2: best ROI. Level 1: chip up to ENTROPY_AT_CHIP, entropy, chip."""
         if self.level >= 2:
             if self.level >= 3:
-                q = self._quantum_target({n: o for n, o in self.options().items() if n not in blocked})
-                if q is not None:
-                    return q
+                c = self._cryostat_maintenance({n: o for n, o in self.options().items() if n not in blocked})
+                if c is not None:
+                    return c
             return self._target_roi(blocked)
         opts = {n: o for n, o in self.options().items() if n not in blocked}
         if self._attacking():
