@@ -79,6 +79,9 @@ MARGIN_SEC = 120             # slack added to a computed revisit time
 UPGRADE_JITTER = (1, 10)     # min: when enough QE for an upgrade, revisit a random 1-10 min later
 CLAIM_PCT = (0.75, 1.0)      # claim when the cache is this fraction full (random per visit, all levels)
 RETRY_MINUTES = 30           # retry an account this many minutes after an error
+ACTION_GAP = (0.8, 2.0)      # s between game POSTs — pace writes so a burst does not trip RATE_LIMITED
+UPGRADES_PER_VISIT = 10      # cap purchases per visit; come back soon for the rest (avoids a request burst)
+RATE_LIMIT_BACKOFF = (90, 240)  # s to wait after a RATE_LIMITED before retrying
 
 
 def level_on(level):
@@ -160,6 +163,8 @@ class Game:
 
     def call(self, method, path, body=None):
         """Returns (ok, data | error code)."""
+        if method != "GET":
+            time.sleep(random.uniform(*ACTION_GAP))   # pace writes so a burst does not trip RATE_LIMITED
         r, data, err = self._send(method, path, body)
         if err == HUMAN_CHECK:
             self._human_check()
@@ -627,10 +632,15 @@ class Tick:
         return None
 
     def upgrades(self):
-        """Buy while QE allows; claim only when balance + cache pays the next upgrade.
-        Returns the upgrade it stopped at (to wait for) or None."""
+        """Buy while QE allows, but capped and paced so a big balance does not burst the server into
+        RATE_LIMITED; claim only when balance + cache pays the next upgrade. Returns the upgrade it stopped
+        at (to wait for) or None."""
         blocked = set()
+        done = 0
         for _ in range(MAX_PURCHASES):
+            if done >= UPGRADES_PER_VISIT:   # cap the burst: come back shortly for the rest
+                self.waits.append((random.uniform(*RATE_LIMIT_BACKOFF), "more upgrades"))
+                return None
             t = self.target(blocked)
             if t is None:
                 return None
@@ -652,6 +662,9 @@ class Tick:
                     return t
             ok, d = self.game.action(path)
             if not ok:
+                if d == "RATE_LIMITED":   # too fast for the server: stop, come back soon to continue
+                    self.waits.append((random.uniform(*RATE_LIMIT_BACKOFF), "rate limit backoff"))
+                    return t
                 if d == "INSUFFICIENT_QE":
                     self.refresh()
                     if self.available >= cost:   # the server still says no: leave it for this tick
@@ -664,6 +677,7 @@ class Tick:
             self.st["qe_balance"] = str(self.balance - cost) if d.get("qe_balance") is None else d["qe_balance"]
             self.spent += cost
             self.bought[name] = self.bought.get(name, 0) + 1
+            done += 1
         return None
 
     # --- the visit -----------------------------------------------------------------------
