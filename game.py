@@ -696,12 +696,15 @@ class Tick:
         if capacity > 0 and amount >= self.claim_level():
             self.claim()
         waiting_for = None
-        for _ in range(5):   # an upgrade may unlock a trial, a trial may unlock an upgrade
-            did = self.trials() if self.level < 2 else False   # L1 trials only; L2 has no such trials
-            before = sum(self.bought.values())
-            waiting_for = self.upgrades() if UPGRADE else None
-            if not did and sum(self.bought.values()) == before:
-                break
+        if self.level < 2:
+            for _ in range(5):   # L1: an upgrade may unlock a trial, a trial may unlock an upgrade
+                did = self.trials()
+                before = sum(self.bought.values())
+                waiting_for = self.upgrades() if UPGRADE else None
+                if not did and sum(self.bought.values()) == before:
+                    break
+        elif UPGRADE:
+            waiting_for = self.upgrades()   # L2+: a single paced, per-visit-capped pass (no trials to loop)
         if self.bought:
             self.refresh()
         return self.plan(waiting_for)
