@@ -823,12 +823,12 @@ class Schedule:
         return (self.data.get(addr.lower()) or {}).get("level")
 
     def recheck_levels(self):
-        """On startup: forget cached levels so each account's level is re-read on its next visit, and bring
-        the skipped ("level off") ones forward so they re-check right away. A restart = re-read all levels."""
+        """On startup: a full re-census. Forget cached levels and make every account due now, so a restart
+        re-reads all levels and drops any stale/long wait from the previous run (e.g. an old 6h park)."""
         with self.lock:
             for e in self.data.values():
-                if e.pop("level", None) is not None and e.get("why") == "level off":
-                    e["next_at"] = 0   # was skipped -> make it due now so the level is re-read
+                e.pop("level", None)
+                e["next_at"] = 0
             write_lines(self.path, [json.dumps(self.data, ensure_ascii=False, indent=1)])
 
     def set(self, addr, next_at, **info):
