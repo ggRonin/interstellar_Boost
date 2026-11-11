@@ -25,6 +25,7 @@ Source of wallets — config.SOURCE:
 
 import json
 import os
+import random
 import sys
 import threading
 import time
@@ -54,6 +55,9 @@ CHECKIN_ENDPOINT = f"{config.API_BASE}/checkin/"
 ACTIVITIES_ENDPOINT = f"{config.API_BASE}/activities/"
 ENTRIES_ENDPOINT = f"{config.API_BASE}/activities/entries/"
 FIRST_CRATE_SLUG = "open-first-crate"
+PARTNERS_ENDPOINT = f"{config.API_BASE}/partners/campaigns/"
+PARTNER_LIST_TTL = 600     # s: the campaign list is the same for everyone — fetched once per 10 min, not per wallet
+PARTNER_GAP = (1.0, 2.5)   # s between partner POSTs (task claims, open), like a person clicking
 
 PROXY_FAIL_EXCEPTIONS = (
     requests.exceptions.ProxyError,
@@ -383,6 +387,104 @@ def do_quests(session):
     return {"done": done, "failed": failed, "first_crate": first_crate}
 
 
+_partner_cache = {"at": 0.0, "live": None}
+_partner_lock = threading.Lock()
+
+
+def _live_partner_campaigns(session):
+    """Live partner campaigns (status "live"), cached for PARTNER_LIST_TTL across all wallets of the run."""
+    with _partner_lock:
+        if _partner_cache["live"] is None or time.monotonic() - _partner_cache["at"] > PARTNER_LIST_TTL:
+            d = session.get(PARTNERS_ENDPOINT, headers={"Referer": f"{config.BASE_URL}/crate"},
+                            timeout=config.API_TIMEOUT).json().get("data") or {}
+            _partner_cache["live"] = [c for c in (d.get("campaigns") or []) if c.get("status") == "live"]
+            _partner_cache["at"] = time.monotonic()
+        return _partner_cache["live"]
+
+
+def _partner_post(session, url, body=None):
+    time.sleep(random.uniform(*PARTNER_GAP))
+    headers = {"X-CSRFToken": session.cookies.get("csrftoken"), "Referer": f"{config.BASE_URL}/crate"}
+    r = session.post(url, json=body, headers=headers, timeout=config.API_TIMEOUT)
+    try:
+        b = r.json()
+    except ValueError:
+        return False, r.status_code
+    if r.status_code not in (200, 201) or not b.get("success"):
+        return False, (b.get("error") or {}).get("code", r.status_code)
+    return True, b.get("data") or {}
+
+
+def partner_crates(session):
+    """Partner crates (e.g. Surgence): finish the link tasks, then open the crate — one open per day.
+
+    Only "live" campaigns are touched; no live campaign -> None and nothing else is requested. A crate
+    already opened today, or one that stays locked (a task that is not a plain link, e.g. no X linked),
+    is skipped without trying to open it. Tasks are claimed like the site's button: link tasks count by
+    the visit itself. Returns [{"name", "state", ...}] for the log."""
+    live = _live_partner_campaigns(session)
+    if not live:
+        return None
+    mine = session.get(f"{PARTNERS_ENDPOINT}me/", headers={"Referer": f"{config.BASE_URL}/crate"},
+                       timeout=config.API_TIMEOUT).json().get("data") or {}
+    mine = {m.get("slug"): m for m in (mine.get("campaigns") or [])}
+    out = []
+    for c in live:
+        slug, name = c.get("slug"), (c.get("partner") or {}).get("name") or c.get("title") or c.get("slug")
+        m = mine.get(slug) or {}
+        if m.get("opened_today"):
+            out.append({"name": name, "state": "opened_today"})
+            continue
+        failed = []
+        if not m.get("unlocked"):
+            entries = m.get("entries") or []
+            for t in c.get("tasks") or []:
+                a = t.get("activity") or {}
+                disp = a.get("display") or {}
+                state, _ = _entry_state(a.get("slug"), a.get("period"), entries)
+                if state == "done":
+                    continue
+                if state != "pending" and disp.get("verify") != "link":
+                    failed.append(f"{t.get('title')}: needs {disp.get('verify')}")   # post / social / email: not ours
+                    continue
+                complete = True if state == "pending" else bool(a.get("is_zero_entry") and not disp.get("member_check"))
+                ok, d = _partner_post(session, f"{PARTNERS_ENDPOINT}{slug}/tasks/{t.get('id')}/claim/",
+                                      {"complete": complete})
+                if not ok:
+                    failed.append(f"{t.get('title')}: {d}")
+            m = next((x for x in (session.get(f"{PARTNERS_ENDPOINT}me/", timeout=config.API_TIMEOUT)
+                                  .json().get("data") or {}).get("campaigns") or [] if x.get("slug") == slug), {})
+        if not m.get("unlocked"):
+            out.append({"name": name, "state": "locked", "failed": failed})
+            continue
+        ok, d = _partner_post(session, f"{PARTNERS_ENDPOINT}{slug}/open/")
+        if not ok:
+            out.append({"name": name, "state": "open_failed", "error": d})
+            continue
+        out.append({"name": name, "state": d.get("state"), "amount": d.get("amount"), "symbol": d.get("symbol"),
+                    "consolation_qe": d.get("consolation_qe"), "email_given": d.get("email_given"),
+                    "email_deadline": d.get("email_deadline"), "day": d.get("day")})
+    return out
+
+
+def describe_partner(p):
+    """One partner-crate result -> a log fragment."""
+    n = p.get("name")
+    st = p.get("state")
+    if st == "consolation":
+        return f"📦 {n} crate: +{p.get('consolation_qe')} QE (no token prize)"
+    if st == "opened_today":
+        return f"{n} crate: opened today"
+    if st == "locked":
+        return f"{n} crate locked: " + (", ".join(p.get("failed") or []) or "tasks not done")
+    if st == "open_failed":
+        return f"{n} crate open failed: {p.get('error')}"
+    prize = f"{p.get('amount')} {p.get('symbol')}"
+    if st == "owed" and not p.get("email_given"):
+        return f"🎉🎉 {n} crate: WON {prize} — GIVE YOUR EMAIL ON THE SITE by {p.get('email_deadline')} (48 h)!"
+    return f"🎉 {n} crate: WON {prize} ({st})"
+
+
 def daily_checkin(session):
     """Ежедневный чек-ин: POST только если сегодня ещё можно (иначе капча тратится зря). Returns summary."""
     st = session.get(CHECKIN_ENDPOINT, timeout=config.API_TIMEOUT).json().get("data") or {}
@@ -431,6 +533,19 @@ def mint_badges(session):
     return {"minted": minted, "failed": failed}
 
 
+CAPTCHA_RETRIES = 2   # сайт отклонил капчу (CAPTCHA_FAILED) -> ещё N попыток с новой капчей (всего 3)
+
+
+def login_retry(siwe):
+    """SIWE login; CAPTCHA_FAILED -> up to CAPTCHA_RETRIES more tries (as Boost.py / Quest.py do)."""
+    for i in range(CAPTCHA_RETRIES + 1):
+        try:
+            return siwe.login()
+        except RuntimeError as e:
+            if "CAPTCHA_FAILED" not in str(e) or i == CAPTCHA_RETRIES:
+                raise
+
+
 def process(idx, proxy, seed, address, token, pool, results, store):
     if results.is_done(address):
         return {"address": address, "ok": True, "skipped": True}
@@ -452,19 +567,20 @@ def process(idx, proxy, seed, address, token, pool, results, store):
                 if token:  # saved session expired -> drop it before trying a fresh login
                     token = ""
                     store.update(address, proxy, token)
-                r = siwe.login()
+                r = login_retry(siwe)
                 user, via, created = r["user"], "login", r.get("created")
             token = siwe.cookie_string()
             store.update(address, proxy, token)
             checkin = daily_checkin(siwe.session) if config.CHECKIN else None
             quests = do_quests(siwe.session) if config.QUESTS else None
             badges = mint_badges(siwe.session) if config.BADGES else None
+            partners = partner_crates(siwe.session) if getattr(config, "PARTNER_CRATES", 1) else None
             chest = open_chests(siwe.session, config.OPEN_BOX) if config.OPEN_BOX > 0 else None
             rec = {
                 "ok": True, "address": siwe.address, "via": via,
                 "user_id": user.get("id"), "status": user.get("status"),
                 "created": created, "proxy": proxy, "checkin": checkin, "quests": quests,
-                "badges": badges,
+                "badges": badges, "partners": partners,
             }
             if chest:
                 rec.update(opened=chest["opened"], rewards=chest["rewards"], qe_final=chest["qe_final"])
@@ -515,6 +631,9 @@ def _print_result(res, addr, done, total):
             parts.append("🏅 minted " + ", ".join(bd["minted"]))
         if bd.get("failed"):
             parts.append("badges failed: " + ", ".join(bd["failed"]))
+    for p in res.get("partners") or []:
+        if p.get("state") != "opened_today":   # nothing new: keep the line short
+            parts.append(describe_partner(p))
     if "opened" in res:
         opened = res.get("opened", 0)
         drops = " + ".join(f"{(x or {}).get('reward_qe', '?')}QE"
@@ -558,6 +677,7 @@ def run(store, source):
     print(f"[*] {pool.remaining()} spare proxies | {config.NUM_THREADS} workers\n")
 
     ok = fail = done = 0
+    wins = []   # partner-crate token prizes of this run (they need an email on the site within 48 h)
     ex = ThreadPoolExecutor(max_workers=config.NUM_THREADS)
     try:
         futs = {ex.submit(process, i, p, s, a, t, pool, results, store): a
@@ -571,6 +691,8 @@ def run(store, source):
             else:
                 fail += 1
             _print_result(res, addr, done, len(todo))
+            wins += [(addr, p) for p in res.get("partners") or []
+                     if p.get("state") not in ("consolation", "opened_today", "locked", "open_failed")]
     except KeyboardInterrupt:
         # не ждать тысячи поставленных в очередь кошельков: только те, что уже в работе
         print("\n[*] Stopping: finishing accounts already in progress...")
@@ -579,6 +701,11 @@ def run(store, source):
     ex.shutdown(wait=True)
 
     print(f"\n[*] DONE — OK: {ok}  FAIL: {fail}  spare proxies left: {pool.remaining()}")
+    if wins:
+        print(f"\n[!] PARTNER CRATE PRIZES this run: {len(wins)} — log in with these wallets and give an email "
+              f"on the site within 48 h, or the prize is lost:")
+        for addr, p in wins:
+            print(f"    {addr} | {describe_partner(p)}")
 
 
 if __name__ == "__main__":

@@ -72,6 +72,14 @@ python -m venv .venv
 
 Откуда брать аккаунты — `GAME_SOURCE` в `config.py`: `1` — `Accounts.txt`, `2` — `Boost.txt`, `3` — `Wallet.txt` (только кошельки с `done`). Остальные настройки игры — переменные `GAME_*` в `config.py`.
 
+## Квесты уровня 3 — `Quest.py`
+
+Отдельный модуль для первых аккаунтов из `Accounts.txt` (`ACCOUNTS = [1, 2, 3]`), только на уровне 3:
+- **волны стражей** (The Slow one → The Opportunist → The Aggressive one): щит (валидация блока) ставится только в ответ на объявленный удар стража, заранее — нет (Opportunist бьёт только без щита). Все волны пройдены — ничего не делает;
+- **охота на шине**: защищает соседей по шине под атакой (до 10 раз в сутки), за это дают E.
+
+Файлы только читает, поэтому может работать одновременно с `game.py`. Настройки — в начале `Quest.py`. Проверить статус без действий: `Quest.py --check`.
+
 ## Запуск
 
 Из папки проекта:
@@ -79,4 +87,5 @@ python -m venv .venv
 ```
 .venv\Scripts\python.exe Boost.py
 .venv\Scripts\python.exe game.py
+.venv\Scripts\python.exe Quest.py
 ```

@@ -35,7 +35,7 @@ from eth_account import Account
 import cap
 import config
 from login_wallets import (PROXY_FAIL_EXCEPTIONS, WALLET_FILE, daily_checkin, do_quests, internet_up,
-                           write_lines)
+                           mint_badges, write_lines)
 from siwe_login import SiweSession
 
 Account.enable_unaudited_hdwallet_features()
@@ -44,7 +44,7 @@ MODE = 2   # 1 — только регистрация кошельков без
 THREADS = 10   # сколько кошельков обрабатывать одновременно
 REGS_MIN = 50   # сколько новых кошельков привязать к одному реф-коду из Ref.txt: случайное число
 REGS_MAX = 130   # от REGS_MIN до REGS_MAX для каждого кода (меньше, если кошельков без done не хватает)
-CAPTCHA_RETRIES = 3   # сколько раз повторить вход, если сайт ответил CAPTCHA_FAILED
+CAPTCHA_RETRIES = 2   # сколько раз повторить, если сайт ответил CAPTCHA_FAILED (всего 3 попытки); общее с game.py/Quest.py
 
 CODES_ENDPOINT = f"{config.API_BASE}/launch/codes/"
 GATE_ENDPOINT = f"{config.API_BASE}/launch/gate/"
@@ -350,6 +350,7 @@ def register_job(codes_store, ref):
             if not admitted:
                 raise RuntimeError(f"ref={res['ref']} | {res['gate']}")
             res["checkin"] = checkin(s)
+            res["badges"] = badges(s)
             res["quests"] = do_quests(s)
             codes = fetch_codes(s)
             if "error" in codes:
@@ -370,8 +371,27 @@ def checkin(session):
             return ci
 
 
+def badges(session):
+    """Weekly check-in badges (every 7 days of streak: +500 QE + NFT, gasless), as login_wallets.py
+    does: only earned, not yet minted ones; a captcha per badge, none when there is nothing to mint.
+    config.BADGES = 0 turns it off."""
+    return mint_badges(session) if config.BADGES else None
+
+
 def checkin_job(siwe):
-    return {"checkin": checkin(siwe.session)}
+    s = siwe.session
+    return {"checkin": checkin(s), "badges": badges(s)}
+
+
+def _describe_badges(bd):
+    if not bd:
+        return ""
+    parts = []
+    if bd.get("minted"):
+        parts.append("🏅 minted " + ", ".join(bd["minted"]))
+    if bd.get("failed"):
+        parts.append("badges failed: " + ", ".join(bd["failed"]))
+    return " | ".join(parts)
 
 
 def _describe_checkin(ci):
@@ -399,12 +419,14 @@ def _describe(res):
     if not res.get("ok"):
         return f"FAIL {res.get('error')}"
     head = f"OK   {res['via']}{' (new account)' if res.get('created') else ''}"
-    if "gate" not in res:   # done wallet: check-in only
-        return f"{head} | {_describe_checkin(res['checkin'])}"
+    bd = _describe_badges(res.get("badges"))
+    bd = f" | {bd}" if bd else ""
+    if "gate" not in res:   # done wallet: check-in (+ badges) only
+        return f"{head} | {_describe_checkin(res['checkin'])}{bd}"
     gate = res["gate"] if res["gate"].startswith("already admitted") else f"admitted with {res['gate']}"
     codes = (f"🔑 +{res['added']} code(s): {', '.join(res['unspent'])}" if res["unspent"]
              else "no unspent codes")
-    return (f"{head} | ref: {res['ref']} | {gate} | {_describe_checkin(res['checkin'])} | "
+    return (f"{head} | ref: {res['ref']} | {gate} | {_describe_checkin(res['checkin'])}{bd} | "
             f"{_describe_quests(res['quests'])} | {codes}")
 
 

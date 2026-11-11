@@ -49,6 +49,8 @@ const PRELUDE = String.raw`(function (E, sink, timers, fontWidths, defaultFontWi
   const getter = (proto, k, fn) => Object.defineProperty(proto, k, { get: fn, configurable: true, enumerable: true });
   const tag = (C, name) => Object.defineProperty(C.prototype, Symbol.toStringTag, { value: name, configurable: true });
   const native = fn => fn.bind(null);   // toString bound-функции — «[native code]»
+  // как native, но с this (геттеры, методы прототипов): toString у Proxy функции в V8 — тоже «[native code]»
+  const nativeThis = fn => new Proxy(fn, {});
 
   class EventTarget {
     constructor() { S.set(this, { listeners: {} }); }
@@ -67,9 +69,21 @@ const PRELUDE = String.raw`(function (E, sink, timers, fontWidths, defaultFontWi
     }
   }
   class Event {
-    constructor(type, init) { def(this, '_t', String(type)); this.bubbles = !!(init && init.bubbles); }
+    constructor(type, init) {
+      def(this, '_t', String(type)); def(this, '_ts', timers.now()); this.bubbles = !!(init && init.bubbles);
+    }
     get type() { return this._t; }
   }
+  // Event.prototype.timeStamp — встроенный геттер (скрипт капчи проверяет, что он «родной»)
+  Object.defineProperty(Event.prototype, 'timeStamp',
+    { get: nativeThis(function () { return this && this._ts !== undefined ? this._ts : 0; }),
+      configurable: true, enumerable: true });
+  // performance — экземпляр Performance, now() в прототипе (Reflect.apply(Performance.prototype.now, performance, []))
+  class Performance {}
+  def(Performance.prototype, 'now', native(() => timers.now()));
+  const performance = Object.create(Performance.prototype);
+  const timeOrigin = Date.now();
+  Object.defineProperty(Performance.prototype, 'timeOrigin', { get: nativeThis(() => timeOrigin), configurable: true, enumerable: true });
   class CustomEvent extends Event {
     constructor(type, init) { super(type, init); def(this, '_d', init && 'detail' in init ? init.detail : null); }
     get detail() { return this._d; }
@@ -251,7 +265,7 @@ const PRELUDE = String.raw`(function (E, sink, timers, fontWidths, defaultFontWi
       [WebGLRenderingContext, 'WebGLRenderingContext'], [CanvasRenderingContext2D, 'CanvasRenderingContext2D'],
       [Document, 'HTMLDocument'], [MimeType, 'MimeType'], [MimeTypeArray, 'MimeTypeArray'], [Plugin, 'Plugin'],
       [PluginArray, 'PluginArray'], [Navigator, 'Navigator'], [Screen, 'Screen'], [Permissions, 'Permissions'],
-      [NavigatorUAData, 'NavigatorUAData'], [Window, 'Window']]) tag(C, n);
+      [NavigatorUAData, 'NavigatorUAData'], [Window, 'Window'], [Performance, 'Performance']]) tag(C, n);
 
   // ── plugins / mimeTypes (как у Chrome со встроенным PDF) ────────────────
   function list(Proto, items, namedKey) {
@@ -319,15 +333,16 @@ const PRELUDE = String.raw`(function (E, sink, timers, fontWidths, defaultFontWi
     EventTarget, Event, CustomEvent, Node, Text, Element, HTMLElement, HTMLDivElement, HTMLSpanElement, HTMLBodyElement,
     HTMLHeadElement, HTMLHtmlElement, HTMLScriptElement, HTMLIFrameElement, HTMLUnknownElement, HTMLCanvasElement,
     WebGLRenderingContext, CanvasRenderingContext2D, Document, HTMLDocument: Document, MimeType, MimeTypeArray, Plugin,
-    PluginArray, Navigator, Screen, Permissions, NavigatorUAData, Window,
+    PluginArray, Navigator, Screen, Permissions, NavigatorUAData, Window, Performance,
     setTimeout: native(timers.setTimeout), clearTimeout: native(timers.clearTimeout),
     setInterval: native(timers.setInterval), clearInterval: native(timers.clearInterval),
     console: { log() {}, info() {}, warn() {}, error() {}, debug() {} },
     atob: native(s => timers.atob(enc(s))), btoa: native(s => timers.btoa(enc(s))),
-    performance: { now: native(() => timers.now()), timeOrigin: Date.now() },
+    performance,
   };
   for (const [k, v] of Object.entries(own)) def(G, k, v);
-  for (const C of [Navigator, Screen, Permissions, MimeType, MimeTypeArray, Plugin, PluginArray, NavigatorUAData, Window, Document]) {
+  for (const C of [Navigator, Screen, Permissions, MimeType, MimeTypeArray, Plugin, PluginArray, NavigatorUAData, Window, Document,
+                   Performance]) {
     // настоящие конструкторы этих интерфейсов недоступны напрямую
     Object.defineProperty(C.prototype, 'constructor', { value: C, writable: true, configurable: true });
   }

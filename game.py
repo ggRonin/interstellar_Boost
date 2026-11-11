@@ -28,7 +28,11 @@ a dead proxy is replaced by the next one from Proxy.txt and written into the wal
 The first game request asks for a human check: POST /game/session/ with a Cap.js captcha -> a game
 session cookie for 12 h, saved with the account session.
 
-Not automated: forks, blocks/shields, sentinel waves, network assault, thrones (on-chain DACC payment).
+Watchers (config.SHIELD / config.BUS_HUNT): once a visit shows an account at level 2+ (level on, not in
+config.SKIP), a separate thread polls it every 15-25 s like Quest.py does: a shield (block validation) only
+in answer to an announced sentinel strike, and the bus hunt (defend neighbours, level 3).
+
+Not automated: forks, network assault, re-tape-out / packages (Quest.py), thrones (on-chain DACC payment).
 """
 
 import json
@@ -48,7 +52,7 @@ from eth_account import Account
 
 import cap
 import config
-from Boost import CAPTCHA_RETRIES, ProxyPool, WalletFile, with_session
+from Boost import CAPTCHA_RETRIES, KeySession, ProxyPool, WalletFile, with_session
 from login_wallets import ACCOUNTS_FILE, WALLET_FILE, AccountStore, BoostStore, internet_up, write_lines
 
 Account.enable_unaudited_hdwallet_features()
@@ -693,7 +697,9 @@ class Tick:
         if capacity > 0 and amount >= self.claim_level():
             self.claim()
         waiting_for = None
-        if self.level < 2:
+        if not getattr(config, "UPGRADE", 1):
+            pass   # config.UPGRADE = 0: claim only — no chip/component purchases, no discounts, no L1 trials
+        elif self.level < 2:
             for _ in range(5):   # L1: an upgrade may unlock a trial, a trial may unlock an upgrade
                 did = self.trials()
                 before = sum(self.bought.values())
@@ -786,20 +792,84 @@ class StoreFile:
         self.store.close()
 
 
+def skip_addresses(wallets):
+    """Addresses the bot never touches (config.SKIP): 1-based file positions and/or address strings."""
+    out = set()
+    for it in getattr(config, "SKIP", None) or []:
+        if isinstance(it, bool):
+            continue
+        if isinstance(it, int):
+            if 1 <= it <= len(wallets):
+                out.add(wallets[it - 1]["address"].lower())
+        elif str(it).strip():
+            out.add(str(it).strip().lower())
+    return out
+
+
 def open_wallets():
-    """SOURCE -> (wallet file, [wallet dicts], description)."""
+    """SOURCE -> (wallet file, [wallet dicts], description). Accounts in config.SKIP are left out."""
     if SOURCE == 3:
         wf = WalletFile(WALLET_FILE)
-        todo, done = wf.split()
-        return wf, done, f"{WALLET_FILE}: {len(done)} done ({len(todo)} not registered skipped)"
-    if SOURCE == 1:
-        sf, name = StoreFile(AccountStore(ACCOUNTS_FILE)), ACCOUNTS_FILE
-    elif SOURCE == 2:
-        sf, name = StoreFile(BoostStore(config.BOOST_FILE)), config.BOOST_FILE
+        todo, wallets = wf.split()
+        sf, desc = wf, f"{WALLET_FILE}: {len(wallets)} done ({len(todo)} not registered skipped)"
     else:
-        raise SystemExit(f"[!] SOURCE must be 1, 2 or 3, got {SOURCE!r}")
-    wallets = sf.wallets()
-    return sf, wallets, f"{name}: {len(wallets)} accounts"
+        if SOURCE == 1:
+            sf, name = StoreFile(AccountStore(ACCOUNTS_FILE)), ACCOUNTS_FILE
+        elif SOURCE == 2:
+            sf, name = StoreFile(BoostStore(config.BOOST_FILE)), config.BOOST_FILE
+        else:
+            raise SystemExit(f"[!] SOURCE must be 1, 2 or 3, got {SOURCE!r}")
+        wallets = sf.wallets()
+        desc = f"{name}: {len(wallets)} accounts"
+    for i, w in enumerate(wallets, 1):
+        w["pos"] = i                 # position in the file (shown in the watcher's log lines)
+    skip = skip_addresses(wallets)   # positions count in full file order, before anything is dropped
+    if skip:
+        kept = [w for w in wallets if w["address"].lower() not in skip]
+        desc += f" ({len(wallets) - len(kept)} skipped by config.SKIP {config.SKIP})"
+        wallets = kept
+    return sf, wallets, desc
+
+
+_Watcher = None
+
+
+def watcher_class():
+    """Quest.py's account loop with the economy off: shield against sentinel strikes (config.SHIELD) and the
+    bus hunt (config.BUS_HUNT). Polls every 15-25 s, so it lives in its own thread next to the scheduler,
+    whose visits can be hours apart. Imported lazily: Quest.py imports this module."""
+    global _Watcher
+    if _Watcher is not None:
+        return _Watcher
+    import Quest
+
+    class Watcher(Quest.Quester):
+        def __init__(self, wallet, wallet_file, pool):
+            super().__init__(wallet.get("pos", "?"), None, wallet["address"], wallet["proxy"], wallet["token"],
+                             None, pool, None)
+            self.w, self.wf = wallet, wallet_file   # the same wallet dict the scheduler's visits use
+            self.economy_on, self.min_level = False, 2
+            self.sentinels_on, self.hunt_on = bool(config.SHIELD), bool(config.BUS_HUNT)
+
+        def new_siwe(self):
+            return KeySession(self.w["key"], self.addr, self.proxy)
+
+        def connect(self):
+            # pick up what the visits saved meanwhile (a swapped proxy, a fresh session)
+            self.proxy, self.token = self.w["proxy"], self.w["token"]
+            super().connect()
+
+        def save(self):
+            if self.w.get("proxy") != self.proxy:
+                self.wf.set_field(self.addr, "proxy", self.proxy)
+            if self.w.get("token") != self.token:
+                self.wf.set_field(self.addr, "token", self.token)
+
+        def level_allowed(self, level):
+            return level_on(level)   # a level that is off in config (played by hand) is left alone
+
+    _Watcher = Watcher
+    return Watcher
 
 
 class Schedule:
@@ -848,7 +918,15 @@ def main():
     now = time.time()
     print(f"[*] Game - {desc} | {config.THREADS} threads | {pool.remaining()} spare proxies")
     print(f"[*] {sum(1 for a in by_addr if sched.due_at(a) <= now)} due now, schedule in "
-          f"{SCHEDULE_FILE} | Ctrl+C to stop\n")
+          f"{SCHEDULE_FILE} | Ctrl+C to stop")
+    print("[*] upgrades: " + ("on (chip / super chip / components)" if getattr(config, "UPGRADE", 1)
+                              else "OFF — claim only (config.UPGRADE = 0)"))
+    watch_on = bool(getattr(config, "SHIELD", 0) or getattr(config, "BUS_HUNT", 0))
+    print(f"[*] watchers: shield {'on' if getattr(config, 'SHIELD', 0) else 'off'}, bus hunt "
+          f"{'on' if getattr(config, 'BUS_HUNT', 0) else 'off'} — started for level 2+ accounts after their "
+          f"first visit\n")
+    watchers = {}                  # address -> thread
+    watch_stop = threading.Event()
 
     stats = {"ticks": 0, "fail": 0, "claimed": Decimal(0), "spent": Decimal(0)}
     running = {}   # future -> address
@@ -897,6 +975,14 @@ def main():
                     stats["spent"] += res["spent"]
                     text = f"{res['via']} | {res['text']}"
                     sched.set(addr, time.time() + sec, why=why, info=res["info"], level=res.get("level"))
+                    lvl = res.get("level") or 0
+                    if watch_on and lvl >= 2 and level_on(lvl) and addr not in watchers:
+                        w = watcher_class()(by_addr[addr], wallet_file, pool)
+                        th = threading.Thread(target=w.run, args=(watch_stop,), daemon=True)
+                        th.start()
+                        watchers[addr] = th
+                        print(f"[{time.strftime('%H:%M:%S')}] {addr} | 🛡 watcher started (level {lvl}): "
+                              f"sentinel shield + bus hunt, {len(watchers)} running")
                 elif res.get("net_down"):   # the machine is offline — not a real per-account error
                     if not net_trouble:
                         print(f"[{time.strftime('%H:%M:%S')}] [!] интернета нет — пауза, прокси не трогаем")
@@ -912,9 +998,11 @@ def main():
                 print(f"[{time.strftime('%H:%M:%S')}] {addr} | {text} | next in {_fmt_wait(sec)} ({why})")
     except KeyboardInterrupt:
         print("\n[*] Stopping: finishing accounts already in progress...")
+        watch_stop.set()
         ex.shutdown(wait=True, cancel_futures=True)
         raise
     finally:
+        watch_stop.set()
         print(f"[*] visits: {stats['ticks']}  FAIL: {stats['fail']}  claimed: {stats['claimed']}QE  "
               f"spent on upgrades: {stats['spent']}QE  spare proxies left: {pool.remaining()}")
         if hasattr(wallet_file, "close"):
